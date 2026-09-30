@@ -1,0 +1,18 @@
+[package]
+name = "steward-index"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+rayon = { workspace = true }
+tokio = { workspace = true }
+turso = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
