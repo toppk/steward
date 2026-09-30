@@ -65,6 +65,13 @@ CREATE TABLE IF NOT EXISTS contentids (
     PRIMARY KEY (dev, ino)
 );
 CREATE INDEX IF NOT EXISTS contentids_root ON contentids(root);
+-- The 1 MiB BEP-52 verification layer of each hashed file bigger than
+-- 1 MiB, by content: any larger power-of-two piece layer derives from it.
+CREATE TABLE IF NOT EXISTS content_layers (
+    root BLOB PRIMARY KEY,
+    size INTEGER NOT NULL,
+    layer BLOB NOT NULL
+);
 -- Which entries carry a hashed inode; one row per hard link, relinked by the
 -- hashing pass after renames.
 CREATE TABLE IF NOT EXISTS content_entries (
@@ -155,6 +162,8 @@ pub struct ScanStats {
     /// Recomputing directory totals afterwards.
     pub totals_ms: u64,
     pub retotalled: u64,
+    /// Known directories whose volume was not mounted; left as indexed.
+    pub offline: Vec<PathBuf>,
 }
 
 /// Receives human-readable progress lines during a scan.
@@ -528,23 +537,30 @@ impl Index {
         let Some(top) = self.get(conn, id).await? else {
             return Ok(());
         };
+        let known = |parent, dev: i64, mtime_ns, ctime_ns| KnownDir {
+            parent,
+            dev: dev as u64,
+            mtime_ns,
+            ctime_ns,
+            subdirs: Vec::new(),
+        };
         snap.insert(
             id,
-            KnownDir {
-                parent: top.parent,
-                mtime_ns: top.meta.mtime_ns,
-                ctime_ns: top.meta.ctime_ns,
-                subdirs: Vec::new(),
-            },
+            known(
+                top.parent,
+                top.meta.dev as i64,
+                top.meta.mtime_ns,
+                top.meta.ctime_ns,
+            ),
         );
-        let mut queue = vec![id];
-        if self.mostly_everything(conn, top.t_dirs).await? {
-            // parent -> (id, name, mtime, ctime) of each directory row.
-            type DirRow = (i64, Box<[u8]>, i64, i64);
-            let mut kids: HashMap<i64, Vec<DirRow>> = HashMap::new();
+        // (id, name, dev, mtime, ctime) of a directory row, by parent.
+        type DirRow = (i64, Box<[u8]>, i64, i64, i64);
+        let mut kids: HashMap<i64, Vec<DirRow>> = HashMap::new();
+        let whole_table = self.mostly_everything(conn, top.t_dirs).await?;
+        if whole_table {
             let mut rows = query(
                 conn,
-                "SELECT id, parent, name, mtime_ns, ctime_ns FROM entries WHERE kind = 1",
+                "SELECT id, parent, name, dev, mtime_ns, ctime_ns FROM entries WHERE kind = 1",
                 (),
             )
             .await?;
@@ -554,52 +570,40 @@ impl Index {
                     blob(&row, 2)?.into(),
                     int(&row, 3)?,
                     int(&row, 4)?,
+                    int(&row, 5)?,
                 ));
             }
-            while let Some(dir) = queue.pop() {
-                for (cid, name, mt, ct) in kids.remove(&dir).unwrap_or_default() {
-                    if let Some(k) = snap.get_mut(&dir) {
-                        k.subdirs.push((name, cid));
-                    }
-                    snap.insert(
-                        cid,
-                        KnownDir {
-                            parent: dir,
-                            mtime_ns: mt,
-                            ctime_ns: ct,
-                            subdirs: Vec::new(),
-                        },
-                    );
-                    queue.push(cid);
-                }
-            }
-        } else {
-            while let Some(dir) = queue.pop() {
+        }
+        let mut queue = vec![id];
+        while let Some(dir) = queue.pop() {
+            let found = if whole_table {
+                kids.remove(&dir).unwrap_or_default()
+            } else {
                 let mut rows = query(
                     conn,
-                    "SELECT id, name, mtime_ns, ctime_ns FROM entries WHERE parent = ?1 AND kind = 1",
+                    "SELECT id, name, dev, mtime_ns, ctime_ns FROM entries \
+                     WHERE parent = ?1 AND kind = 1",
                     (dir,),
                 )
                 .await?;
                 let mut found = Vec::new();
                 while let Some(row) = rows.next().await? {
-                    found.push((int(&row, 0)?, blob(&row, 1)?, int(&row, 2)?, int(&row, 3)?));
+                    found.push((
+                        int(&row, 0)?,
+                        blob(&row, 1)?.into(),
+                        int(&row, 2)?,
+                        int(&row, 3)?,
+                        int(&row, 4)?,
+                    ));
                 }
-                for (cid, name, mt, ct) in found {
-                    if let Some(k) = snap.get_mut(&dir) {
-                        k.subdirs.push((name.into(), cid));
-                    }
-                    snap.insert(
-                        cid,
-                        KnownDir {
-                            parent: dir,
-                            mtime_ns: mt,
-                            ctime_ns: ct,
-                            subdirs: Vec::new(),
-                        },
-                    );
-                    queue.push(cid);
+                found
+            };
+            for (cid, name, dev, mt, ct) in found {
+                if let Some(k) = snap.get_mut(&dir) {
+                    k.subdirs.push((name, cid));
                 }
+                snap.insert(cid, known(dir, dev, mt, ct));
+                queue.push(cid);
             }
         }
         Ok(())
@@ -608,6 +612,7 @@ impl Index {
     /// Bring the index under `root` up to date with the filesystem.
     pub async fn scan(&self, root: &Path, opts: ScanOptions) -> Result<ScanStats> {
         let started = Instant::now();
+        scan::forget_filesystems();
         let scan_start_ns = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_nanos() as i64);
@@ -813,11 +818,32 @@ impl Index {
         stats.dirs_trusted = counters.dirs_trusted.load(Ordering::Relaxed);
         stats.entries_seen = counters.entries.load(Ordering::Relaxed);
         stats.errors = counters.errors.load(Ordering::Relaxed);
+        stats.offline = std::mem::take(
+            &mut *counters
+                .offline
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+        .into_iter()
+        .map(|(p, want, found)| {
+            Progress::say(progress.as_ref(), || {
+                format!(
+                    "{} is offline: indexed on filesystem {want:016x}, found {found:016x}; \
+                     left as indexed",
+                    p.display()
+                )
+            });
+            p
+        })
+        .collect();
         stats.millis = started.elapsed().as_millis() as u64;
         Ok(stats)
     }
 
     async fn apply(&self, conn: &Connection, listing: &Listing, w: &mut Writer) -> Result<()> {
+        if listing.offline {
+            return Ok(());
+        }
         let id = listing.id;
         if listing.known {
             let changed = w.snapshot.get(&id).is_some_and(|k| {
@@ -1581,6 +1607,51 @@ impl Index {
             out.push((blob(&row, 0)?, int(&row, 1)? as u64));
         }
         Ok(out)
+    }
+
+    /// Keep the 1 MiB verification layer of content `root`.
+    pub async fn put_layer(
+        &self,
+        conn: &Connection,
+        root: &[u8],
+        size: u64,
+        layer: &[u8],
+    ) -> Result<()> {
+        exec(
+            conn,
+            "INSERT OR REPLACE INTO content_layers (root, size, layer) VALUES (?1, ?2, ?3)",
+            (root.to_vec(), size as i64, layer.to_vec()),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// The stored 1 MiB layer and file size of content `root`.
+    pub async fn layer(&self, conn: &Connection, root: &[u8]) -> Result<Option<(u64, Vec<u8>)>> {
+        let mut rows = query(
+            conn,
+            "SELECT size, layer FROM content_layers WHERE root = ?1",
+            (root.to_vec(),),
+        )
+        .await?;
+        let Some(row) = rows.next().await? else {
+            return Ok(None);
+        };
+        Ok(Some((int(&row, 0)? as u64, blob(&row, 1)?)))
+    }
+
+    /// The size of content `root`, if any file with it was hashed.
+    pub async fn content_size(&self, conn: &Connection, root: &[u8]) -> Result<Option<u64>> {
+        let mut rows = query(
+            conn,
+            "SELECT size FROM contentids WHERE root = ?1 LIMIT 1",
+            (root.to_vec(),),
+        )
+        .await?;
+        Ok(match rows.next().await? {
+            Some(row) => Some(int(&row, 0)? as u64),
+            None => None,
+        })
     }
 
     /// Record that `entry` carries the hashed inode in `m`.

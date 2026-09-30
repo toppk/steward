@@ -34,6 +34,8 @@ pub fn scanning(c: &mut Client) -> Result<bool, Error> {
 pub struct RootInfo {
     pub settings: RootSettings,
     pub indexed: Option<Entry>,
+    /// Its volume was not mounted at the last scan; the index is unchanged.
+    pub offline: bool,
 }
 
 pub struct Settings {
@@ -54,6 +56,7 @@ pub fn settings(c: &mut Client) -> Result<Settings, Error> {
             Ok(RootInfo {
                 settings: serde_json::from_value(r["settings"].clone())?,
                 indexed: serde_json::from_value(r["indexed"].clone())?,
+                offline: r["offline"].as_bool().unwrap_or(false),
             })
         })
         .collect::<Result<_, serde_json::Error>>()?;

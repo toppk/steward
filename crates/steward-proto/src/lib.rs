@@ -75,6 +75,13 @@ pub enum Request {
     RemoveRoot {
         path: PathBuf,
     },
+    /// The BEP-52 piece layer of content `id` for a power-of-two
+    /// `piece_size` of at least 1 MiB, as concatenated hex SHA-256 hashes;
+    /// empty when the file is no bigger than one piece.
+    PieceLayer {
+        id: String,
+        piece_size: u64,
+    },
     /// Content-id coverage and duplication under `path`.
     ContentSummary {
         path: PathBuf,
@@ -196,6 +203,9 @@ pub struct ScanReport {
     pub deleted: u64,
     pub errors: u64,
     pub millis: u64,
+    /// Known paths whose volume was not mounted; left as indexed.
+    #[serde(default)]
+    pub offline: Vec<String>,
     #[serde(default)]
     pub load_ms: u64,
     #[serde(default)]

@@ -125,7 +125,17 @@ fn bind(socket: &Path) -> Result<UnixListener> {
             socket.display()
         );
     }
-    let _ = std::fs::remove_file(socket);
+    // Only ever remove a stale socket of ours, never anything else.
+    if let Ok(m) = std::fs::symlink_metadata(socket) {
+        use std::os::unix::fs::FileTypeExt;
+        if !m.file_type().is_socket() {
+            bail!(
+                "{} exists and is not a socket; not touching it",
+                socket.display()
+            );
+        }
+        std::fs::remove_file(socket)?;
+    }
     Ok(UnixListener::bind(socket)?)
 }
 

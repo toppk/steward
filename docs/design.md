@@ -170,6 +170,31 @@ under `contentid` in the config are hashed automatically; `steward cid` and
 Queries: `find_content` (id → current paths), `duplicates` (by wasted
 bytes).
 
+### Verification layer
+
+With each content id the hashing pass keeps a **1 MiB verification layer**:
+the root of every 64-block (1 MiB) subtree of the file's BEP-52 tree, 32
+bytes per MiB (about 0.9 GB for 28 TiB), keyed by content id. Any piece
+layer for a power-of-two piece size of 1 MiB or more derives from it by
+hashing pairs upward, so a v2 torrent for already-hashed content never
+re-reads the file; `piece_layer` returns exactly the bytes of a torrent's
+`piece layers` entry (verified against libtorrent at 1, 4 and 16 MiB).
+Files of 1 MiB or less have none, as in BEP 52.
+
+## Filesystems and offline volumes
+
+Stored filesystem identity is `f_fsid` from statvfs, which Linux derives from
+the filesystem UUID (plus the subvolume on btrfs), never `st_dev`: btrfs
+assigns `st_dev` at mount time, so it can change with mount order across
+reboots. A known directory found on a different filesystem than it was
+indexed on belongs to a volume that is not mounted: it is reported
+**offline** and nothing under it is read or changed. An unmounted media
+disk must never read as "630,000 files deleted".
+
+Steward only ever reads indexed files. The only files it writes are its own
+index and socket, `settings.toml` when a root change is requested, and
+qdirstat exports, which refuse to overwrite an existing file.
+
 ## Protocol
 
 One JSON object per line, one response per request:
@@ -226,4 +251,3 @@ in `steward-index`.
   caller's permissions (`SO_PEERCRED`).
 - Paths in JSON are converted lossily; non-UTF-8 names need a byte-safe
   encoding on the wire.
-- Piece layers aren't stored; a torrent app must re-hash to build one.

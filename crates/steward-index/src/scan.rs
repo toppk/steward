@@ -10,8 +10,8 @@ use std::fs::{self, Metadata};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 
 use tokio::sync::mpsc::Sender;
 
@@ -53,14 +53,47 @@ pub struct Meta {
     pub size: u64,
     pub alloc: u64,
     pub nlink: u64,
+    /// The filesystem's stable id (see `fs_id`), not `st_dev`.
     pub dev: u64,
     pub ino: u64,
     pub mtime_ns: i64,
     pub ctime_ns: i64,
 }
 
+/// A filesystem's stable identity: `f_fsid` from statvfs, which Linux
+/// derives from the filesystem's UUID (and the subvolume on btrfs). `st_dev`
+/// is not usable as a stored key: btrfs assigns it at mount time, so it can
+/// change with mount order across reboots.
+fn fs_id(st_dev: u64, path: &Path, is_dir: bool) -> u64 {
+    static IDS: LazyLock<Mutex<HashMap<u64, u64>>> = LazyLock::new(Mutex::default);
+    let mut ids = IDS.lock().unwrap_or_else(PoisonError::into_inner);
+    if FORGET.swap(false, Ordering::Relaxed) {
+        ids.clear();
+    }
+    if let Some(&id) = ids.get(&st_dev) {
+        return id;
+    }
+    // statvfs follows symlinks, so ask the directory holding a non-directory.
+    let probe = if is_dir {
+        path
+    } else {
+        path.parent().unwrap_or(path)
+    };
+    let id = rustix::fs::statvfs(probe).map_or(st_dev, |v| v.f_fsid);
+    ids.insert(st_dev, id);
+    id
+}
+
+/// Mount topology can change between scans (a volume unmounted, another
+/// mounted with a reused `st_dev`); each scan starts with a fresh map.
+pub fn forget_filesystems() {
+    FORGET.store(true, Ordering::Relaxed);
+}
+
+static FORGET: AtomicBool = AtomicBool::new(false);
+
 impl Meta {
-    pub fn from_std(m: &Metadata) -> Self {
+    pub fn from_std(m: &Metadata, path: &Path) -> Self {
         let ft = m.file_type();
         let kind = if ft.is_dir() {
             Kind::Dir
@@ -87,7 +120,7 @@ impl Meta {
             size: m.size(),
             alloc: m.blocks() * 512,
             nlink: m.nlink(),
-            dev: m.dev(),
+            dev: fs_id(m.dev(), path, kind == Kind::Dir),
             ino: m.ino(),
             mtime_ns: m.mtime() * 1_000_000_000 + m.mtime_nsec(),
             // Only directories' ctime is used (trusting rescans); a file's
@@ -102,7 +135,7 @@ impl Meta {
     }
 
     pub fn lstat(path: &Path) -> std::io::Result<Self> {
-        fs::symlink_metadata(path).map(|m| Self::from_std(&m))
+        fs::symlink_metadata(path).map(|m| Self::from_std(&m, path))
     }
 }
 
@@ -117,6 +150,9 @@ pub struct Listing {
     pub meta: Meta,
     /// The index held this directory when the scan started.
     pub known: bool,
+    /// Known, but now on a different filesystem (its volume is not
+    /// mounted): nothing under it was read, and nothing stored changes.
+    pub offline: bool,
     /// `None` when the directory was trusted unchanged or could not be read;
     /// the writer then leaves its stored children alone.
     pub entries: Option<Vec<Child>>,
@@ -136,6 +172,9 @@ pub struct Child {
 #[derive(Debug)]
 pub struct KnownDir {
     pub parent: i64,
+    /// The filesystem it was on; finding it on another means the volume
+    /// that held it is not mounted.
+    pub dev: u64,
     pub mtime_ns: i64,
     pub ctime_ns: i64,
     pub subdirs: Vec<(Box<[u8]>, i64)>,
@@ -150,6 +189,8 @@ pub struct Counters {
     pub entries: AtomicU64,
     pub errors: AtomicU64,
     pub cancelled: AtomicBool,
+    /// Directories found offline, with the expected and found filesystem.
+    pub offline: Mutex<Vec<(PathBuf, u64, u64)>>,
 }
 
 pub struct Walker {
@@ -184,6 +225,28 @@ impl Walker {
             return;
         }
         let known = self.snapshot.get(&id);
+        if let Some(k) = known
+            && k.dev != meta.dev
+        {
+            self.counters
+                .offline
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push((path.clone(), k.dev, meta.dev));
+            let listing = Listing {
+                id,
+                parent,
+                path,
+                meta,
+                known: true,
+                offline: true,
+                entries: None,
+            };
+            if self.tx.blocking_send(listing).is_err() {
+                self.counters.cancelled.store(true, Ordering::Relaxed);
+            }
+            return;
+        }
         let trusted = self.trust_dir_mtime
             && known.is_some_and(|k| k.mtime_ns == meta.mtime_ns && k.ctime_ns == meta.ctime_ns);
 
@@ -211,6 +274,7 @@ impl Walker {
             path,
             meta,
             known: known.is_some(),
+            offline: false,
             entries,
         };
         if self.tx.blocking_send(listing).is_err() {

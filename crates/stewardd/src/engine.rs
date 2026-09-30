@@ -48,6 +48,8 @@ fn duration(secs: f64) -> String {
 
 pub struct Engine {
     hashing: std::sync::Mutex<Option<HashProgress>>,
+    /// Directories the last scans found on an unmounted volume.
+    offline: std::sync::Mutex<Vec<std::path::PathBuf>>,
     /// A pool of its own, so a days-long hashing job never takes the threads
     /// directory scans need; replaced when `hash_threads` changes.
     hash_pool: std::sync::RwLock<std::sync::Arc<rayon::ThreadPool>>,
@@ -124,6 +126,7 @@ pub fn report(s: &ScanStats) -> ScanReport {
         deleted: s.deleted,
         errors: s.errors,
         millis: s.millis,
+        offline: s.offline.iter().map(|p| p.display().to_string()).collect(),
         load_ms: s.load_ms,
         write_ms: s.write_ms,
         totals_ms: s.totals_ms,
@@ -176,6 +179,7 @@ impl Engine {
         crate::say!(1, "hashing uses {} threads", config.hash_threads());
         Ok(Self {
             hashing: std::sync::Mutex::new(None),
+            offline: std::sync::Mutex::default(),
             hash_pool: std::sync::RwLock::new(build_hash_pool(config.hash_threads())),
             index,
             config: std::sync::RwLock::new(config),
@@ -408,6 +412,7 @@ impl Engine {
                 self.reload().await?
             }
             Request::ContentSummary { path } => self.content_summary(&path).await?,
+            Request::PieceLayer { id, piece_size } => self.piece_layer(&id, piece_size).await?,
         })
     }
 
@@ -432,7 +437,13 @@ impl Engine {
                     .map(|rec| entry(&rec, &r.path, vec![])),
                 None => None,
             };
-            roots.push(json!({ "settings": r, "indexed": indexed }));
+            let offline = self
+                .offline
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter()
+                .any(|p| p == &r.path);
+            roots.push(json!({ "settings": r, "indexed": indexed, "offline": offline }));
         }
         Ok(json!({
             "file": Config::path(),
@@ -534,6 +545,21 @@ impl Engine {
             opts.exclude
         );
         let stats = self.index.scan(path, opts).await?;
+        for p in &stats.offline {
+            crate::say!(
+                0,
+                "{} is offline (its volume is not mounted); left as indexed",
+                p.display()
+            );
+        }
+        {
+            let mut offline = self
+                .offline
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            offline.retain(|p| !p.starts_with(&stats.root));
+            offline.extend(stats.offline.iter().cloned());
+        }
         crate::say!(
             1,
             "{kind} scan of {} done in {} ms: read {} dirs, trusted {}, {} errors; load {} ms, \
@@ -625,7 +651,9 @@ impl Engine {
         if m.kind != Kind::File {
             bail!("{} is not a regular file", path.display());
         }
-        if let Some(root) = self.index.fresh_content_id(conn, m).await? {
+        if let Some(root) = self.index.fresh_content_id(conn, m).await?
+            && self.has_layer(conn, &root, m.size).await?
+        {
             return Ok(root
                 .try_into()
                 .ok()
@@ -637,13 +665,69 @@ impl Engine {
         if Meta::lstat(path)? != *m {
             return Ok(None);
         }
-        if let Some(c) = cid {
-            self.index.put_content_id(conn, m, &c.root).await?;
+        if let Some(h) = &cid {
+            self.save_hash(conn, m, h).await?;
             if let Some(entry) = self.index.resolve(conn, path).await? {
                 self.index.link_content(conn, entry, m).await?;
             }
         }
-        Ok(cid)
+        Ok(cid.map(|h| h.id))
+    }
+
+    /// Content known to be hashed also has its verification layer, unless
+    /// the file is too small to have one.
+    async fn has_layer(&self, conn: &turso::Connection, root: &[u8], size: u64) -> Result<bool> {
+        Ok(size <= steward_contentid::LAYER_PIECE || self.index.layer(conn, root).await?.is_some())
+    }
+
+    async fn save_hash(
+        &self,
+        conn: &turso::Connection,
+        m: &Meta,
+        h: &steward_contentid::Hashed,
+    ) -> Result<()> {
+        self.index.put_content_id(conn, m, &h.id.root).await?;
+        if !h.layer.is_empty() {
+            self.index
+                .put_layer(conn, &h.id.root, h.id.size, &h.layer.concat())
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// The BEP-52 piece layer of content `id` for `piece_size`, derived from
+    /// the stored 1 MiB layer without reading the file.
+    async fn piece_layer(&self, id: &str, piece_size: u64) -> Result<Value> {
+        let cid = ContentId::from_hex(id, 0).context("content id is 64 hex digits")?;
+        let conn = self.index.connect()?;
+        let (size, layer) = match self.index.layer(&conn, &cid.root).await? {
+            Some((size, bytes)) => {
+                let layer: Vec<[u8; 32]> = bytes
+                    .chunks_exact(32)
+                    .map(|c| c.try_into().expect("32 bytes"))
+                    .collect();
+                (size, layer)
+            }
+            None => match self.index.content_size(&conn, &cid.root).await? {
+                // Too small to have one: BEP 52 gives it no piece layer.
+                Some(size) if size <= steward_contentid::LAYER_PIECE => (size, Vec::new()),
+                Some(_) => bail!("no verification layer stored for {id}; hash the file again"),
+                None => bail!("unknown content {id}"),
+            },
+        };
+        let hashes =
+            steward_contentid::piece_layer(&layer, size, piece_size).with_context(|| {
+                format!(
+                    "piece size must be a power of two of at least {}",
+                    steward_contentid::LAYER_PIECE
+                )
+            })?;
+        Ok(json!({
+            "id": format!("btv2:{}", cid.to_hex()),
+            "size": size,
+            "piece_size": piece_size,
+            "layer": hashes.iter().map(|h| steward_contentid::hex(h)).collect::<String>(),
+        }))
     }
 
     pub async fn hash_tree(&self, path: &Path) -> Result<Value> {
@@ -655,7 +739,11 @@ impl Engine {
             if r.meta.kind != Kind::File || r.meta.size == 0 {
                 continue;
             }
-            if self.index.fresh_content_id(&conn, &r.meta).await?.is_none() {
+            let hashed = match self.index.fresh_content_id(&conn, &r.meta).await? {
+                Some(root) => self.has_layer(&conn, &root, r.meta.size).await?,
+                None => false,
+            };
+            if !hashed {
                 stale.push((p, r.meta, r.id));
             } else {
                 current.push((r.id, r.meta));
@@ -687,7 +775,7 @@ impl Engine {
 
         // Results stream back as each file finishes, so a restart loses at
         // most the files in flight.
-        let (tx, mut rx) = mpsc::channel::<(i64, Meta, Option<steward_contentid::ContentId>)>(256);
+        let (tx, mut rx) = mpsc::channel::<(i64, Meta, Option<steward_contentid::Hashed>)>(256);
         let pool = std::sync::Arc::clone(
             &self
                 .hash_pool
@@ -746,8 +834,8 @@ impl Engine {
             {
                 let n = batch.len();
                 conn.execute("BEGIN", ()).await?;
-                for (entry, m, c) in batch.drain(..) {
-                    self.index.put_content_id(&conn, &m, &c.root).await?;
+                for (entry, m, h) in batch.drain(..) {
+                    self.save_hash(&conn, &m, &h).await?;
                     self.index.link_content(&conn, entry, &m).await?;
                     hashed += 1;
                 }

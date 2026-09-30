@@ -1,7 +1,6 @@
 //! Export a subtree as a qdirstat 2.0 cache file (`.qdirstat.cache.gz`),
 //! byte-compatible with qdirstat's `CacheWriter` so either tool can read it.
 
-use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
@@ -107,7 +106,17 @@ pub async fn export(
     out: &Path,
 ) -> Result<u64> {
     let top = index.get(conn, id).await?.context("vanished")?;
-    let file = File::create(out).with_context(|| out.display().to_string())?;
+    // Never overwrite an existing file.
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(out)
+        .with_context(|| {
+            format!(
+                "{} (exports never overwrite an existing file)",
+                out.display()
+            )
+        })?;
     let mut w = GzEncoder::new(
         BufWriter::with_capacity(1 << 20, file),
         Compression::default(),

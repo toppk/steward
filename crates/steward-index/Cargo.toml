@@ -11,6 +11,7 @@ workspace = true
 [dependencies]
 anyhow = { workspace = true }
 ignore = { workspace = true }
+rustix = { version = "1.1", features = ["fs"] }
 rayon = { workspace = true }
 tokio = { workspace = true }
 turso = { workspace = true }

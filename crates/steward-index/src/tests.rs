@@ -278,3 +278,55 @@ async fn files_keep_no_ctime_and_old_indexes_are_migrated() {
     let s = index.scan(&root, opts()).await.unwrap();
     assert_eq!(s.updated, 0, "migrated on open, so the scan sees no change");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_directory_on_another_filesystem_is_offline_not_deleted() {
+    let (_tmp, index, root) = fixture().await;
+    index.scan(&root, opts()).await.unwrap();
+    let conn = index.connect().unwrap();
+    // As if `a` had been indexed on a volume that is no longer mounted.
+    let a = index
+        .resolve(&conn, &root.join("a"))
+        .await
+        .unwrap()
+        .unwrap();
+    conn.execute("UPDATE entries SET dev = dev + 1 WHERE id = ?1", (a,))
+        .await
+        .unwrap();
+    fs::remove_dir_all(root.join("a")).unwrap();
+    fs::create_dir(root.join("a")).unwrap();
+
+    let s = index.scan(&root, opts()).await.unwrap();
+    assert_eq!(s.offline, [root.join("a")]);
+    assert_eq!(s.deleted, 0);
+    assert!(
+        index
+            .resolve(&conn, &root.join("a/b/two.txt"))
+            .await
+            .unwrap()
+            .is_some()
+    );
+
+    // The same for a whole root.
+    let r = index.resolve(&conn, &root).await.unwrap().unwrap();
+    conn.execute("UPDATE entries SET dev = dev + 1 WHERE id = ?1", (r,))
+        .await
+        .unwrap();
+    fs::remove_file(root.join("top.txt")).unwrap();
+    let s = index.scan(&root, opts()).await.unwrap();
+    assert_eq!(s.offline, std::slice::from_ref(&root));
+    assert!(
+        index
+            .resolve(&conn, &root.join("top.txt"))
+            .await
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[test]
+fn filesystem_ids_are_not_st_dev() {
+    let here = std::env::current_dir().unwrap();
+    let m = Meta::lstat(&here).unwrap();
+    assert_eq!(m.dev, rustix::fs::statvfs(&here).unwrap().f_fsid);
+}

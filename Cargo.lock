@@ -7000,6 +7000,7 @@ dependencies = [
  "anyhow",
  "ignore",
  "rayon",
+ "rustix 1.1.5",
  "tempfile",
  "tokio",
  "turso",

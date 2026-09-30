@@ -282,6 +282,10 @@ impl Render for Shell {
                 ButtonVariant::Secondary
             };
             let tip = match &r.indexed {
+                _ if r.offline => format!(
+                    "{}: offline (volume not mounted); showing the index as last scanned",
+                    path.display()
+                ),
                 Some(e) => format!(
                     "{}: {} dirs, {} files, {} on disk",
                     path.display(),
@@ -292,9 +296,17 @@ impl Render for Shell {
                 None => format!("{}: not scanned yet", path.display()),
             };
             roots = roots.child(with_tooltip(
-                button(("root", i), root_label(&path), variant, cx).on_click(
-                    cx.listener(move |this, _, _, cx| this.switch_root(path.clone(), cx)),
-                ),
+                button(
+                    ("root", i),
+                    if r.offline {
+                        format!("{} (offline)", root_label(&path))
+                    } else {
+                        root_label(&path)
+                    },
+                    variant,
+                    cx,
+                )
+                .on_click(cx.listener(move |this, _, _, cx| this.switch_root(path.clone(), cx))),
                 tip,
             ));
         }

@@ -193,6 +193,15 @@ class _Ops:
         return _op("content_summary", path=_abs(path))
 
     @staticmethod
+    def piece_layer(content_id: str, piece_size: int) -> _Op:
+        return _op(
+            "piece_layer",
+            lambda r: bytes.fromhex(r["layer"]),
+            id=content_id,
+            piece_size=piece_size,
+        )
+
+    @staticmethod
     def export_qdirstat(path: PathLike, out: PathLike) -> _Op:
         return _op("export_qdirstat", path=_abs(path), out=_abs(out))
 
@@ -281,6 +290,13 @@ class Client:
     def export_qdirstat(self, path: PathLike, out: PathLike) -> dict:
         """Write a qdirstat cache file; ``out`` is written by the daemon."""
         return self._do(_Ops.export_qdirstat(path, out))
+
+    def piece_layer(self, content_id: str, piece_size: int = 1 << 20) -> bytes:
+        """The BEP-52 ``piece layers`` value for ``content_id`` at
+        ``piece_size`` (a power of two >= 1 MiB): concatenated 32-byte
+        SHA-256 hashes, empty for a file no bigger than one piece. Derived
+        from the stored 1 MiB layer; the file is not read."""
+        return self._do(_Ops.piece_layer(content_id, piece_size))
 
     def settings(self) -> dict:
         """Settings file, and each root's policy with its index state."""
@@ -382,6 +398,9 @@ class AsyncClient:
 
     async def export_qdirstat(self, path: PathLike, out: PathLike) -> dict:
         return await self._do(_Ops.export_qdirstat(path, out))
+
+    async def piece_layer(self, content_id: str, piece_size: int = 1 << 20) -> bytes:
+        return await self._do(_Ops.piece_layer(content_id, piece_size))
 
     async def settings(self) -> dict:
         return await self._do(_Ops.settings())

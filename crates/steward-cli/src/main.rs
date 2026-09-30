@@ -52,6 +52,13 @@ enum Cmd {
     ContentSummary {
         path: PathBuf,
     },
+    /// BEP-52 piece layer of a content id (hex), from the stored 1 MiB layer.
+    PieceLayer {
+        id: String,
+        /// Bytes; a power of two of at least 1 MiB.
+        #[arg(short, long, default_value_t = 1 << 20)]
+        piece_size: u64,
+    },
     /// Rescan a path now.
     Scan {
         path: PathBuf,
@@ -259,6 +266,7 @@ fn main() -> Result<()> {
         }
         Cmd::RemoveRoot { path } => c.request(&Request::RemoveRoot { path: abs(path)? })?,
         Cmd::ContentSummary { path } => c.request(&Request::ContentSummary { path: abs(path)? })?,
+        Cmd::PieceLayer { id, piece_size } => c.request(&Request::PieceLayer { id, piece_size })?,
         Cmd::Scan { path, trust } => c.request(&Request::Scan {
             path: abs(path)?,
             trust_dir_mtime: trust,
