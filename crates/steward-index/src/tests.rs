@@ -252,3 +252,29 @@ async fn content_lookup_follows_links_hardlinks_and_renames() {
         [root.join("a/also.txt"), root.join("moved.txt")]
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn files_keep_no_ctime_and_old_indexes_are_migrated() {
+    let (tmp, index, root) = fixture().await;
+    index.scan(&root, opts()).await.unwrap();
+    let conn = index.connect().unwrap();
+    let get = async |p: &str| {
+        let id = index.resolve(&conn, &root.join(p)).await.unwrap().unwrap();
+        index.get(&conn, id).await.unwrap().unwrap().meta
+    };
+    assert_eq!(get("top.txt").await.ctime_ns, 0);
+    assert_ne!(get("a").await.ctime_ns, 0);
+
+    // An index from before: files carry real ctimes and no layout version.
+    conn.execute("UPDATE entries SET ctime_ns = 12345 WHERE kind != 1", ())
+        .await
+        .unwrap();
+    conn.execute("DELETE FROM meta WHERE key = 'layout'", ())
+        .await
+        .unwrap();
+    drop(conn);
+    drop(index);
+    let index = Index::open(&tmp.path().join("db/index.db")).await.unwrap();
+    let s = index.scan(&root, opts()).await.unwrap();
+    assert_eq!(s.updated, 0, "migrated on open, so the scan sees no change");
+}

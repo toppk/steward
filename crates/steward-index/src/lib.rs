@@ -81,6 +81,10 @@ CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value INTEGER NOT NULL);
 /// under another version gets every total recomputed on open.
 const TOTALS_VERSION: i64 = 2;
 
+/// Bumped when stored columns change meaning; `open` migrates older indexes.
+/// 1: files store ctime 0 (only directories keep it).
+const LAYOUT_VERSION: i64 = 1;
+
 /// Past this many directories to re-total, one pass over the whole table
 /// beats a query per directory.
 const FULL_AGGREGATE_OVER: usize = 50_000;
@@ -471,6 +475,24 @@ impl Index {
             None => 0,
         };
         drop(rows);
+        let mut rows = query(&conn, "SELECT value FROM meta WHERE key = 'layout'", ()).await?;
+        let layout = match rows.next().await? {
+            Some(row) => int(&row, 0)?,
+            None => 0,
+        };
+        drop(rows);
+        if layout < 1 {
+            // Without this the next scan would see every file as changed.
+            exec(&conn, "UPDATE entries SET ctime_ns = 0 WHERE kind != 1", ()).await?;
+        }
+        if layout != LAYOUT_VERSION {
+            exec(
+                &conn,
+                "INSERT OR REPLACE INTO meta (key, value) VALUES ('layout', ?1)",
+                (LAYOUT_VERSION,),
+            )
+            .await?;
+        }
         if version != TOTALS_VERSION {
             exec(&conn, "BEGIN", ()).await?;
             Self::full_aggregate(&conn).await?;

@@ -90,7 +90,14 @@ impl Meta {
             dev: m.dev(),
             ino: m.ino(),
             mtime_ns: m.mtime() * 1_000_000_000 + m.mtime_nsec(),
-            ctime_ns: m.ctime() * 1_000_000_000 + m.ctime_nsec(),
+            // Only directories' ctime is used (trusting rescans); a file's
+            // changes on rename, chmod or a new hard link, none of which the
+            // index needs to notice, and it would cost 8 bytes per row.
+            ctime_ns: if kind == Kind::Dir {
+                m.ctime() * 1_000_000_000 + m.ctime_nsec()
+            } else {
+                0
+            },
         }
     }
 

@@ -40,7 +40,15 @@ survive), `kind`, `mode`, `uid`, `gid`, `size`, `alloc` (`st_blocks*512`),
 `nlink`, `dev`, `ino`, `mtime_ns`, `ctime_ns`, plus subtree totals `t_size`,
 `t_alloc`, `t_files`, `t_dirs` on directories. Roots have `parent = 0` and
 their absolute path as `name`. `UNIQUE(parent, name)` serves both tree
-navigation and path resolution.
+navigation and path resolution; it is the only secondary index.
+
+Kept lean on purpose (measured on a 15.7M-entry home, 1.9 GB): files store
+ctime and totals as 0, which take no bytes, because only directories' ctime
+(trusting rescans) and totals are used; a file's share of its directory's
+totals is computed from its own size, alloc and nlink. Two further options
+were measured and deferred until size matters: keying the name index on a
+hash (about 270 MB, but the database would no longer enforce one entry per
+name), and compressing timestamps.
 
 **Scan pipeline.** A rayon walker (the dust/disktree shape) stats every
 entry and sends one `Listing` per directory to a single async writer. A
