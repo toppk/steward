@@ -118,9 +118,30 @@ enum Cmd {
         #[arg(short, long)]
         out: PathBuf,
     },
-    /// Send a raw JSON request.
+    /// Where copies of each content id are now, and whether they are reachable.
+    Resolve {
+        ids: Vec<String>,
+        /// Re-stat each copy before answering.
+        #[arg(long)]
+        recheck: bool,
+    },
+    /// Update the index for these paths now and give their content ids.
+    Inspect {
+        paths: Vec<PathBuf>,
+    },
+    /// Print content and storage events as they happen (one JSON per line).
+    Events {
+        /// Replay the daemon's backlog after this sequence number first.
+        #[arg(long)]
+        since: Option<u64>,
+        /// Only content events for these ids (storage events always show).
+        #[arg(long)]
+        id: Vec<String>,
+    },
+    /// Call any method: `steward raw stat '{"path": "/tmp"}'`.
     Raw {
-        json: String,
+        method: String,
+        params: Option<String>,
     },
 }
 
@@ -194,18 +215,27 @@ impl Backend {
         Ok(Self::Local(rt, Box::new(engine)))
     }
 
-    fn call(&mut self, req: &Value) -> Result<Value> {
+    fn call(&mut self, method: &str, params: Value) -> Result<Value> {
         match self {
-            Self::Socket(c) => Ok(c.call(req)?),
+            Self::Socket(c) => Ok(c.call(method, params)?),
             Self::Local(rt, engine) => {
-                let req: Request = serde_json::from_value(req.clone())?;
+                let req = steward_proto::RpcRequest {
+                    jsonrpc: steward_proto::JSONRPC.into(),
+                    id: None,
+                    method: method.into(),
+                    params: Some(params),
+                }
+                .request()
+                .map_err(|e| anyhow::anyhow!(e.message))?;
                 rt.block_on(engine.handle(req))
             }
         }
     }
 
     fn request(&mut self, req: &Request) -> Result<Value> {
-        self.call(&serde_json::to_value(req)?)
+        let v = serde_json::to_value(req)?;
+        let method = v["method"].as_str().unwrap_or_default().to_string();
+        self.call(&method, v.get("params").cloned().unwrap_or(json!({})))
     }
 
     fn children(&mut self, path: PathBuf) -> Result<Vec<Entry>> {
@@ -311,8 +341,34 @@ fn main() -> Result<()> {
             path: abs(path)?,
             out: abs(out)?,
         })?,
-        Cmd::Raw { json: text } => {
-            c.call(&serde_json::from_str::<Value>(&text).unwrap_or(json!(text)))?
+        Cmd::Resolve { ids, recheck } => c.request(&Request::Resolve {
+            contents: ids
+                .into_iter()
+                .map(|id| steward_proto::ContentRef { id, size: None })
+                .collect(),
+            recheck,
+        })?,
+        Cmd::Inspect { paths } => c.request(&Request::Inspect {
+            paths: paths.into_iter().map(abs).collect::<Result<_>>()?,
+        })?,
+        Cmd::Events { since, id } => {
+            let Backend::Socket(client) = c else {
+                anyhow::bail!("events come from the daemon; drop --db");
+            };
+            let ids = (!id.is_empty()).then_some(id);
+            let mut stream = client.subscribe(since, ids)?;
+            eprintln!("{}", stream.start);
+            for msg in &mut stream {
+                println!("{}", msg?);
+            }
+            return Ok(());
+        }
+        Cmd::Raw { method, params } => {
+            let params = match params {
+                Some(p) => serde_json::from_str(&p)?,
+                None => json!({}),
+            };
+            c.call(&method, params)?
         }
     };
     println!("{}", serde_json::to_string_pretty(&out)?);

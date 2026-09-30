@@ -1,6 +1,7 @@
 //! The steward service: owns the index, keeps it current by periodic rescans
-//! and client invalidations (no inotify), and answers queries on a unix
-//! socket.
+//! and client invalidations (no inotify), and answers JSON-RPC 2.0 on two Unix
+//! sockets: `api.socket` for administration and `content.socket` for the
+//! application-facing content primitives.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -9,7 +10,8 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;
-use steward_proto::{Request, Response};
+use serde_json::{Value, json};
+use steward_proto::{JSONRPC, Request, RpcError, RpcRequest, RpcResponse, code};
 use stewardd::config::Config;
 use stewardd::engine::Engine;
 use stewardd::say;
@@ -56,7 +58,14 @@ async fn main() -> Result<()> {
 
     let socket = steward_proto::socket_path();
     let listener = bind(&socket)?;
-    say!(0, "listening on {}", socket.display());
+    let content_socket = steward_proto::content_socket_path();
+    let content_listener = bind(&content_socket)?;
+    say!(
+        0,
+        "listening on {} (administration) and {} (content)",
+        socket.display(),
+        content_socket.display()
+    );
 
     tokio::spawn(invalidation_worker(Arc::clone(&engine), rx));
     {
@@ -106,12 +115,130 @@ async fn main() -> Result<()> {
 
     let mut next_conn: u64 = 0;
     loop {
-        let (stream, _) = listener.accept().await?;
+        let (stream, admin) = tokio::select! {
+            r = listener.accept() => (r?.0, true),
+            r = content_listener.accept() => (r?.0, false),
+        };
         next_conn += 1;
         let pid = stream.peer_cred().ok().and_then(|c| c.pid());
-        say!(2, "conn {next_conn}: opened by pid {pid:?}");
-        tokio::spawn(serve(Arc::clone(&engine), stream, next_conn));
+        let which = if admin { "api" } else { "content" };
+        say!(2, "conn {next_conn}: {which} socket opened by pid {pid:?}");
+        tokio::spawn(serve(Arc::clone(&engine), stream, next_conn, admin));
     }
+}
+
+/// What `content.socket` offers: reads of the catalog and the content
+/// primitives. Configuration, maintenance jobs and file exports are
+/// administration and stay on `api.socket`.
+fn application_method(req: &Request) -> bool {
+    matches!(
+        req,
+        Request::Status
+            | Request::Stat { .. }
+            | Request::Children { .. }
+            | Request::Locate { .. }
+            | Request::ContentId { .. }
+            | Request::FindContent { .. }
+            | Request::Duplicates { .. }
+            | Request::ContentSummary { .. }
+            | Request::PieceLayer { .. }
+            | Request::Resolve { .. }
+            | Request::Inspect { .. }
+            | Request::Verify { .. }
+            | Request::Invalidate { .. }
+            | Request::Subscribe { .. }
+            | Request::Unsubscribe
+    )
+}
+
+fn line(msg: &impl serde::Serialize) -> Vec<u8> {
+    let mut out = serde_json::to_vec(msg).unwrap_or_default();
+    out.push(b'\n');
+    out
+}
+
+fn reply(id: Value, result: Result<Value, RpcError>) -> Vec<u8> {
+    let (result, error) = match result {
+        Ok(r) => (Some(r), None),
+        Err(e) => (None, Some(e)),
+    };
+    line(&RpcResponse {
+        jsonrpc: JSONRPC.into(),
+        id,
+        result,
+        error,
+    })
+}
+
+fn notification(method: &str, params: impl serde::Serialize) -> Vec<u8> {
+    line(&json!({ "jsonrpc": JSONRPC, "method": method, "params": params }))
+}
+
+/// Starts delivering events on a connection; returns the subscribe result
+/// and the task forwarding them.
+fn subscribe(
+    engine: &Engine,
+    since: Option<u64>,
+    ids: Option<Vec<String>>,
+    out: mpsc::Sender<Vec<u8>>,
+) -> Result<(Value, tokio::task::JoinHandle<()>), RpcError> {
+    let ids = match ids {
+        Some(ids) => Some(
+            ids.iter()
+                .map(|i| stewardd::engine::normalize_id(i))
+                .collect::<Result<HashSet<_>>>()
+                .map_err(|e| {
+                    RpcError::new(code::INVALID_PARAMS, "invalid_params", e.to_string())
+                })?,
+        ),
+        None => None,
+    };
+    let start = engine.events.subscribe(since);
+    let result = json!({
+        "epoch": engine.events.epoch,
+        "seq": start.seq,
+        "complete": start.complete,
+    });
+    let mut live = start.live;
+    let replay = start.replay;
+    let task = tokio::spawn(async move {
+        use tokio::sync::broadcast::error::RecvError;
+        let mut last = 0;
+        for r in replay {
+            last = r.seq;
+            if stewardd::events::wanted(ids.as_ref(), &r)
+                && out.send(notification("event", &*r)).await.is_err()
+            {
+                return;
+            }
+        }
+        loop {
+            match live.recv().await {
+                Ok(r) => {
+                    if r.seq <= last {
+                        continue;
+                    }
+                    last = r.seq;
+                    if stewardd::events::wanted(ids.as_ref(), &r)
+                        && out.send(notification("event", &*r)).await.is_err()
+                    {
+                        return;
+                    }
+                }
+                Err(RecvError::Lagged(_)) => {
+                    if out
+                        .send(notification("gap", json!({ "after": last })))
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+                Err(RecvError::Closed) => return,
+            }
+        }
+    });
+    Ok((result, task))
 }
 
 fn bind(socket: &Path) -> Result<UnixListener> {
@@ -139,39 +266,120 @@ fn bind(socket: &Path) -> Result<UnixListener> {
     Ok(UnixListener::bind(socket)?)
 }
 
-async fn serve(engine: Arc<Engine>, stream: UnixStream, conn: u64) {
+async fn serve(engine: Arc<Engine>, stream: UnixStream, conn: u64, admin: bool) {
     let (read, mut write) = stream.into_split();
+    let (out, mut outgoing) = mpsc::channel::<Vec<u8>>(1024);
+    let writer = tokio::spawn(async move {
+        while let Some(bytes) = outgoing.recv().await {
+            if write.write_all(&bytes).await.is_err() {
+                break;
+            }
+        }
+    });
+    let mut events: Option<tokio::task::JoinHandle<()>> = None;
     let mut lines = BufReader::new(read).lines();
-    while let Ok(Some(line)) = lines.next_line().await {
-        let t = std::time::Instant::now();
-        let response = match serde_json::from_str::<Request>(&line) {
-            Ok(req) => match engine.handle(req).await {
-                Ok(result) => Response::Ok { result },
-                Err(e) => Response::Error {
-                    message: format!("{e:#}"),
-                },
-            },
-            Err(e) => Response::Error {
-                message: format!("bad request: {e}"),
-            },
+    while let Ok(Some(text)) = lines.next_line().await {
+        let msg: RpcRequest = match serde_json::from_str::<Value>(&text) {
+            Err(e) => {
+                let e = RpcError::new(code::PARSE, "parse_error", e.to_string());
+                let _ = out.send(reply(Value::Null, Err(e))).await;
+                continue;
+            }
+            Ok(v) => {
+                let id = v.get("id").cloned().unwrap_or(Value::Null);
+                match serde_json::from_value::<RpcRequest>(v) {
+                    Ok(m) if m.jsonrpc == JSONRPC => m,
+                    _ => {
+                        let e = RpcError::new(
+                            code::INVALID_REQUEST,
+                            "invalid_request",
+                            "not a JSON-RPC 2.0 request",
+                        );
+                        let _ = out.send(reply(id, Err(e))).await;
+                        continue;
+                    }
+                }
+            }
         };
-        let mut out = serde_json::to_vec(&response).unwrap_or_default();
-        let outcome = match &response {
-            Response::Ok { .. } => "ok".to_string(),
-            Response::Error { message } => format!("error: {message}"),
+        let id = msg.id.clone();
+        let req = msg.request().and_then(|req| {
+            if admin || application_method(&req) {
+                Ok(req)
+            } else {
+                Err(RpcError::new(
+                    code::FAILED,
+                    "forbidden",
+                    format!(
+                        "{} is administration: use {}",
+                        msg.method,
+                        steward_proto::socket_path().display()
+                    ),
+                ))
+            }
+        });
+        let result = match req {
+            Err(e) => Err(e),
+            Ok(Request::Subscribe { since, ids }) => {
+                if let Some(t) = events.take() {
+                    t.abort();
+                }
+                // The result goes out before the first replayed event.
+                match subscribe(&engine, since, ids, out.clone()) {
+                    Ok((result, task)) => {
+                        if let Some(id) = &id {
+                            let _ = out.send(reply(id.clone(), Ok(result))).await;
+                        }
+                        events = Some(task);
+                        say!(2, "conn {conn}: subscribed");
+                        continue;
+                    }
+                    Err(e) => Err(e),
+                }
+            }
+            Ok(Request::Unsubscribe) => {
+                if let Some(t) = events.take() {
+                    t.abort();
+                }
+                Ok(Value::Bool(true))
+            }
+            Ok(req) => {
+                // Requests run concurrently; responses carry their ids.
+                let (engine, out) = (Arc::clone(&engine), out.clone());
+                tokio::spawn(async move {
+                    let t = std::time::Instant::now();
+                    let result = engine.handle(req).await.map_err(|e| {
+                        RpcError::new(
+                            code::FAILED,
+                            stewardd::engine::kind_of(&e),
+                            format!("{e:#}"),
+                        )
+                    });
+                    let outcome = match &result {
+                        Ok(_) => "ok".to_string(),
+                        Err(e) => format!("{}: {}", e.kind(), e.message),
+                    };
+                    say!(
+                        2,
+                        "conn {conn}: {} -> {outcome}, {} ms",
+                        truncate(&text, 200),
+                        t.elapsed().as_millis()
+                    );
+                    if let Some(id) = id {
+                        let _ = out.send(reply(id, result)).await;
+                    }
+                });
+                continue;
+            }
         };
-        say!(
-            2,
-            "conn {conn}: {} -> {outcome}, {} bytes, {} ms",
-            truncate(&line, 200),
-            out.len(),
-            t.elapsed().as_millis()
-        );
-        out.push(b'\n');
-        if write.write_all(&out).await.is_err() {
-            break;
+        if let Some(id) = id {
+            let _ = out.send(reply(id, result)).await;
         }
     }
+    if let Some(t) = events.take() {
+        t.abort();
+    }
+    drop(out);
+    let _ = writer.await;
     say!(2, "conn {conn}: closed");
 }
 

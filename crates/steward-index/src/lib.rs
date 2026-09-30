@@ -129,6 +129,9 @@ pub struct ScanOptions {
     /// Directories whose times fall within this long before the scan are
     /// stored as untrusted (mlocate's guard against same-tick changes).
     pub recent_window: std::time::Duration,
+    /// Read the scan root's own listing even when trusting: files changed
+    /// in place leave their directory's times alone.
+    pub read_root: bool,
 }
 
 impl Default for ScanOptions {
@@ -140,6 +143,7 @@ impl Default for ScanOptions {
             exclude_base: None,
             progress: None,
             recent_window: std::time::Duration::from_secs(1),
+            read_root: false,
         }
     }
 }
@@ -164,6 +168,106 @@ pub struct ScanStats {
     pub retotalled: u64,
     /// Known directories whose volume was not mounted; left as indexed.
     pub offline: Vec<PathBuf>,
+    /// Paths that became, or stopped being, observations of hashed content.
+    pub content: Vec<ContentChange>,
+}
+
+/// A path gained or lost a hashed content id during a scan. A lost and an
+/// observed change with the same inode in one scan are a move.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ContentChange {
+    pub root: Vec<u8>,
+    pub path: PathBuf,
+    pub dev: u64,
+    pub ino: u64,
+    pub kind: ChangeKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChangeKind {
+    Observed,
+    Deleted,
+    Changed,
+}
+
+/// After this many point lookups a scan loads every hashed inode instead.
+const LINK_LOOKUPS: u32 = 2048;
+
+/// A hashed inode's (size, mtime, root) by its (dev, ino).
+type HashedInodes = HashMap<(i64, i64), (i64, i64, Vec<u8>)>;
+
+/// Hashed inodes (size, mtime, root) by (dev, ino), looked up one at a time
+/// until a scan meets enough new files that loading them all is cheaper.
+#[derive(Default)]
+struct Linker {
+    all: Option<HashedInodes>,
+    lookups: u32,
+}
+
+impl Linker {
+    /// The content root `m` holds, if its inode was hashed at this size and
+    /// mtime.
+    async fn hashed(&mut self, conn: &Connection, m: &Meta) -> Result<Option<Vec<u8>>> {
+        if m.kind != Kind::File || m.size == 0 {
+            return Ok(None);
+        }
+        let key = (m.dev as i64, m.ino as i64);
+        let found = if let Some(all) = &self.all {
+            all.get(&key).cloned()
+        } else if self.lookups >= LINK_LOOKUPS {
+            let mut all = HashMap::new();
+            let mut rows = query(
+                conn,
+                "SELECT dev, ino, size, mtime_ns, root FROM contentids",
+                (),
+            )
+            .await?;
+            while let Some(row) = rows.next().await? {
+                all.insert(
+                    (int(&row, 0)?, int(&row, 1)?),
+                    (int(&row, 2)?, int(&row, 3)?, blob(&row, 4)?),
+                );
+            }
+            let found = all.get(&key).cloned();
+            self.all = Some(all);
+            found
+        } else {
+            self.lookups += 1;
+            let mut rows = query(
+                conn,
+                "SELECT size, mtime_ns, root FROM contentids WHERE dev = ?1 AND ino = ?2",
+                key,
+            )
+            .await?;
+            match rows.next().await? {
+                Some(row) => Some((int(&row, 0)?, int(&row, 1)?, blob(&row, 2)?)),
+                None => None,
+            }
+        };
+        Ok(found.and_then(|(size, mtime, root)| {
+            (size == m.size as i64 && mtime == m.mtime_ns).then_some(root)
+        }))
+    }
+}
+
+/// The content `entry` is a current observation of: linked, and its stored
+/// stat still matching the hash.
+async fn observed(conn: &Connection, entry: i64) -> Result<Option<(Vec<u8>, u64, u64)>> {
+    let mut rows = query(
+        conn,
+        "SELECT c.root, c.dev, c.ino FROM content_entries l \
+             JOIN contentids c ON c.dev = l.dev AND c.ino = l.ino \
+             JOIN entries e ON e.id = l.entry \
+             AND e.dev = c.dev AND e.ino = c.ino AND e.size = c.size \
+             AND e.mtime_ns = c.mtime_ns \
+             WHERE l.entry = ?1",
+        (entry,),
+    )
+    .await?;
+    Ok(match rows.next().await? {
+        Some(row) => Some((blob(&row, 0)?, int(&row, 1)? as u64, int(&row, 2)? as u64)),
+        None => None,
+    })
 }
 
 /// Receives human-readable progress lines during a scan.
@@ -466,6 +570,7 @@ struct Writer {
     parents: HashMap<i64, i64>,
     dirty: Dirty,
     ins: Inserter,
+    linker: Linker,
     stats: ScanStats,
 }
 
@@ -703,6 +808,7 @@ impl Index {
             snapshot: Arc::clone(&snapshot),
             next_id: Arc::clone(&ins.next_id),
             trust_dir_mtime: opts.trust_dir_mtime,
+            always_read: if opts.read_root { root_id } else { 0 },
             one_filesystem: opts.one_filesystem,
             counters: Arc::clone(&counters),
             tx,
@@ -720,6 +826,7 @@ impl Index {
             parents,
             dirty: Dirty::default(),
             ins,
+            linker: Linker::default(),
             stats: ScanStats {
                 root: root.clone(),
                 ..ScanStats::default()
@@ -884,6 +991,11 @@ impl Index {
                     // stored children and fools a later trusting scan.
                     let own_listing = m.kind == Kind::Dir && m.dev == listing.meta.dev;
                     if old.meta != *m && !own_listing {
+                        // Before the update: it reads the old stat from the row.
+                        if m.kind == Kind::File {
+                            let path = listing.path.join(&child.name);
+                            Self::relink(conn, w, old.id, &old.meta, m, path).await?;
+                        }
                         update_meta(conn, old.id, &guarded(m, w.recent_ns)).await?;
                         w.stats.updated += 1;
                         changed = true;
@@ -891,7 +1003,9 @@ impl Index {
                 }
                 other => {
                     if let Some(old) = other {
-                        w.stats.deleted += Self::delete_subtree(conn, old.id).await?;
+                        let path = listing.path.join(&child.name);
+                        w.stats.deleted +=
+                            Self::delete_subtree(conn, old.id, path, &mut w.stats.content).await?;
                     }
                     match child.dir_id {
                         Some(cid) if w.adopt.contains(&cid) => {
@@ -912,7 +1026,17 @@ impl Index {
                             w.dirty.mark(cid);
                         }
                         None => {
-                            w.ins.add(conn, id, key, m).await?;
+                            let entry = w.ins.add(conn, id, key, m).await?;
+                            if let Some(root) = w.linker.hashed(conn, m).await? {
+                                self.link_content(conn, entry, m).await?;
+                                w.stats.content.push(ContentChange {
+                                    root,
+                                    path: listing.path.join(&child.name),
+                                    dev: m.dev,
+                                    ino: m.ino,
+                                    kind: ChangeKind::Observed,
+                                });
+                            }
                         }
                     }
                     w.stats.inserted += 1;
@@ -921,7 +1045,9 @@ impl Index {
             }
         }
         for old in stored.into_values() {
-            w.stats.deleted += Self::delete_subtree(conn, old.id).await?;
+            let path = listing.path.join(&old.name);
+            w.stats.deleted +=
+                Self::delete_subtree(conn, old.id, path, &mut w.stats.content).await?;
             changed = true;
         }
         if changed {
@@ -930,13 +1056,82 @@ impl Index {
         Ok(())
     }
 
-    async fn delete_subtree(conn: &Connection, id: i64) -> Result<u64> {
-        let mut stack = vec![id];
+    /// A file row changed in place: follow its content link to the inode and
+    /// stat it has now.
+    async fn relink(
+        conn: &Connection,
+        w: &mut Writer,
+        entry: i64,
+        old: &Meta,
+        m: &Meta,
+        path: PathBuf,
+    ) -> Result<()> {
+        let before = match w.linker.hashed(conn, old).await? {
+            Some(_) => observed(conn, entry).await?.map(|(root, ..)| root),
+            None => None,
+        };
+        let after = w.linker.hashed(conn, m).await?;
+        if after.is_some() {
+            exec(
+                conn,
+                "INSERT OR REPLACE INTO content_entries (entry, dev, ino) VALUES (?1, ?2, ?3)",
+                (entry, m.dev as i64, m.ino as i64),
+            )
+            .await?;
+        }
+        let same_inode = old.dev == m.dev && old.ino == m.ino;
+        if before.is_some() && before == after && same_inode {
+            return Ok(());
+        }
+        if let Some(root) = before {
+            w.stats.content.push(ContentChange {
+                root,
+                path: path.clone(),
+                dev: old.dev,
+                ino: old.ino,
+                kind: ChangeKind::Changed,
+            });
+        }
+        if let Some(root) = after {
+            w.stats.content.push(ContentChange {
+                root,
+                path,
+                dev: m.dev,
+                ino: m.ino,
+                kind: ChangeKind::Observed,
+            });
+        }
+        Ok(())
+    }
+
+    async fn delete_subtree(
+        conn: &Connection,
+        id: i64,
+        path: PathBuf,
+        changes: &mut Vec<ContentChange>,
+    ) -> Result<u64> {
+        let mut stack = vec![(id, path)];
         let mut n = 0;
-        while let Some(cur) = stack.pop() {
-            let mut rows = query(conn, "SELECT id FROM entries WHERE parent = ?1", (cur,)).await?;
+        while let Some((cur, path)) = stack.pop() {
+            let mut rows = query(
+                conn,
+                "SELECT id, name FROM entries WHERE parent = ?1",
+                (cur,),
+            )
+            .await?;
             while let Some(row) = rows.next().await? {
-                stack.push(int(&row, 0)?);
+                let name = OsString::from_vec(blob(&row, 1)?);
+                stack.push((int(&row, 0)?, path.join(name)));
+            }
+            drop(rows);
+            if let Some((root, dev, ino)) = observed(conn, cur).await? {
+                changes.push(ContentChange {
+                    root,
+                    path,
+                    dev,
+                    ino,
+                    kind: ChangeKind::Deleted,
+                });
             }
             exec(conn, "DELETE FROM entries WHERE id = ?1", (cur,)).await?;
             exec(conn, "DELETE FROM tags WHERE entry = ?1", (cur,)).await?;
@@ -1660,6 +1855,51 @@ impl Index {
             conn,
             "INSERT OR REPLACE INTO content_entries (entry, dev, ino) VALUES (?1, ?2, ?3)",
             (entry, m.dev as i64, m.ino as i64),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// The size of content `root` if Steward has ever hashed it, even when
+    /// no file holds it now (its verification layer outlives the inode).
+    pub async fn known_size(&self, conn: &Connection, root: &[u8]) -> Result<Option<u64>> {
+        if let Some(size) = self.content_size(conn, root).await? {
+            return Ok(Some(size));
+        }
+        let mut rows = query(
+            conn,
+            "SELECT size FROM content_layers WHERE root = ?1",
+            (root.to_vec(),),
+        )
+        .await?;
+        Ok(match rows.next().await? {
+            Some(row) => Some(int(&row, 0)? as u64),
+            None => None,
+        })
+    }
+
+    /// Entries linked to inode (dev, ino): its hard links.
+    pub async fn inode_entries(&self, conn: &Connection, dev: u64, ino: u64) -> Result<Vec<i64>> {
+        let mut rows = query(
+            conn,
+            "SELECT entry FROM content_entries WHERE dev = ?1 AND ino = ?2",
+            (dev as i64, ino as i64),
+        )
+        .await?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await? {
+            out.push(int(&row, 0)?);
+        }
+        Ok(out)
+    }
+
+    /// Stop holding any content id for inode (dev, ino); the next hashing
+    /// pass reads it again.
+    pub async fn forget_content_id(&self, conn: &Connection, dev: u64, ino: u64) -> Result<()> {
+        exec(
+            conn,
+            "DELETE FROM contentids WHERE dev = ?1 AND ino = ?2",
+            (dev as i64, ino as i64),
         )
         .await?;
         Ok(())

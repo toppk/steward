@@ -1,17 +1,86 @@
 //! Request handling over an index, shared by the daemon and the CLI's
 //! offline `--db` mode.
 
-use std::collections::HashMap;
-use std::path::Path;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 use steward_contentid::ContentId;
-use steward_index::{Index, Kind, Meta, Record, ScanOptions, ScanStats};
-use steward_proto::{Entry, Request, ScanReport};
+use steward_index::{ChangeKind, Index, Kind, Meta, Record, ScanOptions, ScanStats};
+use steward_proto::{ContentRef, Entry, Request, ScanReport};
 use tokio::sync::{Mutex, mpsc};
 
 use crate::config::Config;
+
+/// An error with a stable `data.type` for clients; any other error is
+/// reported as `failed`.
+#[derive(Debug)]
+pub struct Failure {
+    pub kind: &'static str,
+    pub message: String,
+}
+
+impl std::fmt::Display for Failure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for Failure {}
+
+pub fn fail(kind: &'static str, message: impl Into<String>) -> anyhow::Error {
+    Failure {
+        kind,
+        message: message.into(),
+    }
+    .into()
+}
+
+/// The stable type of an error from `handle`.
+pub fn kind_of(e: &anyhow::Error) -> &'static str {
+    e.downcast_ref::<Failure>().map_or("failed", |f| f.kind)
+}
+
+fn content_hex(root: &[u8]) -> String {
+    format!("btv2:{}", steward_contentid::hex(root))
+}
+
+/// A content id from a client, with or without its `btv2:` prefix.
+pub fn parse_id(id: &str) -> Result<[u8; 32]> {
+    ContentId::from_hex(&id.to_ascii_lowercase(), 0)
+        .map(|c| c.root)
+        .ok_or_else(|| {
+            fail(
+                "invalid_params",
+                format!("{id:?} is not a content id (btv2:<64 hex>)"),
+            )
+        })
+}
+
+/// Canonical form of a client's content id, for matching event filters.
+pub fn normalize_id(id: &str) -> Result<String> {
+    parse_id(id).map(|r| content_hex(&r))
+}
+
+/// Marks a path as under verification until dropped.
+struct Suspect<'a>(&'a std::sync::Mutex<HashSet<PathBuf>>, PathBuf);
+
+impl Drop for Suspect<'_> {
+    fn drop(&mut self) {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.1);
+    }
+}
+
+/// How hashing one file went.
+enum Hashing {
+    Done(Option<steward_contentid::Hashed>),
+    Changing,
+    Failed(String),
+}
 
 /// A hashing job in flight, reported by `status`.
 #[derive(Clone, Debug, serde::Serialize)]
@@ -47,6 +116,9 @@ fn duration(secs: f64) -> String {
 }
 
 pub struct Engine {
+    pub events: crate::events::Bus,
+    /// Paths under `verify`: withheld from `resolve` until it answers.
+    suspect: std::sync::Mutex<HashSet<PathBuf>>,
     hashing: std::sync::Mutex<Option<HashProgress>>,
     /// Directories the last scans found on an unmounted volume.
     offline: std::sync::Mutex<Vec<std::path::PathBuf>>,
@@ -178,6 +250,8 @@ impl Engine {
         let index = Index::open(&config.db).await?;
         crate::say!(1, "hashing uses {} threads", config.hash_threads());
         Ok(Self {
+            events: crate::events::Bus::default(),
+            suspect: std::sync::Mutex::default(),
             hashing: std::sync::Mutex::new(None),
             offline: std::sync::Mutex::default(),
             hash_pool: std::sync::RwLock::new(build_hash_pool(config.hash_threads())),
@@ -233,6 +307,8 @@ impl Engine {
                     "removed {} ({n} entries): no longer configured",
                     path.display()
                 );
+                self.events
+                    .emit("storage.unindexed", json!({ "path": path }));
                 removed.push(path.display().to_string());
             }
         }
@@ -320,14 +396,7 @@ impl Engine {
                 path,
                 trust_dir_mtime,
             } => {
-                if self.managed && !self.config().covers(&path) {
-                    bail!(
-                        "{} is not under a configured root; add a [[root]] to {} and run \
-                         `steward reload`",
-                        path.display(),
-                        Config::path().display()
-                    );
-                }
+                self.require_root(&path)?;
                 serde_json::to_value(self.refresh(&path, trust_dir_mtime).await?)?
             }
             Request::Invalidate { path } => match &self.invalidate {
@@ -381,10 +450,10 @@ impl Engine {
             }
             Request::HashTree { path } => self.hash_tree(&path).await?,
             Request::FindContent { id } => {
-                let cid = ContentId::from_hex(&id, 0).context("content id is 64 hex digits")?;
+                let root = parse_id(&id)?;
                 let mut cache = HashMap::new();
                 let mut out = Vec::new();
-                for eid in idx.find_content(&conn, &cid.root).await? {
+                for eid in idx.find_content(&conn, &root).await? {
                     out.push(
                         idx.path_of(&conn, eid, &mut cache)
                             .await?
@@ -413,7 +482,509 @@ impl Engine {
             }
             Request::ContentSummary { path } => self.content_summary(&path).await?,
             Request::PieceLayer { id, piece_size } => self.piece_layer(&id, piece_size).await?,
+            Request::Resolve { contents, recheck } => {
+                self.resolve_contents(contents, recheck).await?
+            }
+            Request::Inspect { paths } => self.inspect(paths).await?,
+            Request::Verify { id, path, reason } => self.verify(&id, &path, &reason).await?,
+            Request::Subscribe { .. } | Request::Unsubscribe => {
+                bail!("subscriptions belong to a connection; send them to the daemon")
+            }
         })
+    }
+
+    fn require_root(&self, path: &Path) -> Result<()> {
+        if self.managed && !self.config().covers(path) {
+            return Err(fail(
+                "not_under_root",
+                format!(
+                    "{} is not under a configured root; add a [[root]] to {} and run \
+                     `steward reload`",
+                    path.display(),
+                    Config::path().display()
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Current observations of each content, in request order.
+    async fn resolve_contents(&self, contents: Vec<ContentRef>, recheck: bool) -> Result<Value> {
+        let roots = contents
+            .iter()
+            .map(|c| parse_id(&c.id))
+            .collect::<Result<Vec<_>>>()?;
+        let conn = self.index.connect()?;
+        if recheck {
+            steward_index::scan::forget_filesystems();
+        }
+        let offline = self
+            .offline
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let suspect = self
+            .suspect
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let mut cache = HashMap::new();
+        let mut stale: HashSet<PathBuf> = HashSet::new();
+        let mut out = Vec::new();
+        for (c, root) in contents.iter().zip(&roots) {
+            let id = content_hex(root);
+            let known = self.index.known_size(&conn, root).await?;
+            if let (Some(want), Some(have)) = (c.size, known)
+                && want != have
+            {
+                out.push(json!({
+                    "id": id, "size": have, "state": "mismatch", "layer": false,
+                    "observations": [],
+                }));
+                continue;
+            }
+            let mut obs = Vec::new();
+            for eid in self.index.find_content(&conn, root).await? {
+                let Some(rec) = self.index.get(&conn, eid).await? else {
+                    continue;
+                };
+                let path = self.index.path_of(&conn, eid, &mut cache).await?;
+                if suspect.contains(&path) {
+                    continue;
+                }
+                let mut offline_at = offline.iter().find(|o| path.starts_with(o)).cloned();
+                if recheck {
+                    match Meta::lstat(&path) {
+                        Ok(m)
+                            if m.dev == rec.meta.dev
+                                && m.ino == rec.meta.ino
+                                && m.size == rec.meta.size
+                                && m.mtime_ns == rec.meta.mtime_ns =>
+                        {
+                            // Reachable after all: its volume is back.
+                            if let Some(dir) = offline_at.take() {
+                                stale.insert(dir);
+                            }
+                        }
+                        Ok(_) => {
+                            stale.insert(path.parent().unwrap_or(&path).to_path_buf());
+                            continue;
+                        }
+                        Err(_) => match self.offline_ancestor(&conn, &path).await? {
+                            Some(dir) => offline_at = Some(dir),
+                            None => {
+                                stale.insert(path.parent().unwrap_or(&path).to_path_buf());
+                                continue;
+                            }
+                        },
+                    }
+                }
+                obs.push((
+                    offline_at.is_none(),
+                    json!({
+                        "path": path,
+                        "inode": format!("{:x}:{}", rec.meta.dev, rec.meta.ino),
+                        "online": offline_at.is_none(),
+                        "offline_at": offline_at,
+                        "mtime_ns": rec.meta.mtime_ns,
+                    }),
+                ));
+            }
+            obs.sort_by(|a, b| {
+                b.0.cmp(&a.0)
+                    .then_with(|| a.1["path"].as_str().cmp(&b.1["path"].as_str()))
+            });
+            let state = if obs.iter().any(|o| o.0) {
+                "present"
+            } else if !obs.is_empty() {
+                "offline"
+            } else if known.is_some() {
+                "absent"
+            } else {
+                "unknown"
+            };
+            let layer = match known {
+                Some(size) => self.has_layer(&conn, root, size).await?,
+                None => false,
+            };
+            out.push(json!({
+                "id": id,
+                "size": known,
+                "state": state,
+                "layer": layer,
+                "observations": obs.into_iter().map(|o| o.1).collect::<Vec<_>>(),
+            }));
+        }
+        // Copies found changed or gone: let a rescan bring the catalog along.
+        if let Some(tx) = &self.invalidate {
+            for dir in stale {
+                let _ = tx.send(dir);
+            }
+        }
+        Ok(json!(out))
+    }
+
+    /// The indexed directory above `path` whose volume is not mounted now:
+    /// the nearest existing ancestor sits on another filesystem than the
+    /// index recorded.
+    async fn offline_ancestor(
+        &self,
+        conn: &turso::Connection,
+        path: &Path,
+    ) -> Result<Option<PathBuf>> {
+        for dir in path.ancestors().skip(1) {
+            let Ok(m) = Meta::lstat(dir) else {
+                continue;
+            };
+            let Some(id) = self.index.resolve(conn, dir).await? else {
+                return Ok(None);
+            };
+            let rec = self.index.get(conn, id).await?;
+            return Ok(rec
+                .filter(|r| r.meta.kind == Kind::Dir && r.meta.dev != m.dev)
+                .map(|_| dir.to_path_buf()));
+        }
+        Ok(None)
+    }
+
+    /// Bring the catalog up to date for `paths` now and establish the
+    /// content ids of the regular files among them.
+    async fn inspect(&self, paths: Vec<PathBuf>) -> Result<Value> {
+        let item_error = |path: &Path, e: &anyhow::Error| {
+            json!({
+                "path": path, "kind": null, "id": null, "size": 0,
+                "error": { "type": kind_of(e), "message": format!("{e:#}") },
+            })
+        };
+        let mut out: Vec<Option<Value>> = vec![None; paths.len()];
+        let mut dirs = Vec::new();
+        let mut parents = std::collections::BTreeSet::new();
+        for (i, path) in paths.iter().enumerate() {
+            let checked = if path.is_absolute() {
+                self.require_root(path)
+            } else {
+                Err(fail(
+                    "invalid_params",
+                    format!("{} is not absolute", path.display()),
+                ))
+            };
+            if let Err(e) = checked {
+                out[i] = Some(item_error(path, &e));
+                continue;
+            }
+            match Meta::lstat(path) {
+                Ok(m) if m.kind == Kind::Dir => dirs.push(i),
+                _ => {
+                    parents.insert(path.parent().unwrap_or(path).to_path_buf());
+                }
+            }
+        }
+        for &i in &dirs {
+            if let Err(e) = self.refresh(&paths[i], false).await {
+                out[i] = Some(item_error(&paths[i], &e));
+            }
+        }
+        for dir in parents {
+            let target = dir.ancestors().find(|a| a.is_dir()).unwrap_or(&dir);
+            if let Err(e) = self.refresh_with(target, true, true).await {
+                crate::say!(0, "inspect: scan of {}: {e:#}", target.display());
+            }
+        }
+
+        let conn = self.index.connect()?;
+        let mut to_hash = Vec::new();
+        for (i, path) in paths.iter().enumerate() {
+            if out[i].is_some() {
+                continue;
+            }
+            let m = match Meta::lstat(path) {
+                Ok(m) => m,
+                Err(e) => {
+                    let kind = if e.kind() == std::io::ErrorKind::NotFound {
+                        "not_found"
+                    } else {
+                        "unreadable"
+                    };
+                    out[i] = Some(item_error(
+                        path,
+                        &fail(kind, format!("{}: {e}", path.display())),
+                    ));
+                    continue;
+                }
+            };
+            let kind = serde_json::to_value(kind(m.kind))?;
+            if m.kind != Kind::File || m.size == 0 {
+                out[i] = Some(json!({
+                    "path": path, "kind": kind, "id": null, "size": m.size, "error": null,
+                }));
+                continue;
+            }
+            if let Some(root) = self.index.fresh_content_id(&conn, &m).await?
+                && self.has_layer(&conn, &root, m.size).await?
+            {
+                out[i] = Some(json!({
+                    "path": path, "kind": kind, "id": content_hex(&root), "size": m.size,
+                    "error": null,
+                }));
+                continue;
+            }
+            to_hash.push((i, path.clone(), m));
+        }
+        let files = to_hash.iter().map(|(_, p, m)| (p.clone(), *m)).collect();
+        let results = self.hash_now(files).await?;
+        for ((i, path, m), result) in to_hash.into_iter().zip(results) {
+            let kind = serde_json::to_value(kind(m.kind))?;
+            out[i] = Some(match result {
+                Hashing::Done(h) => {
+                    let id = match h {
+                        Some(h) => {
+                            self.record_hash(&conn, &path, &m, &h).await?;
+                            Some(content_hex(&h.id.root))
+                        }
+                        None => None,
+                    };
+                    json!({ "path": path, "kind": kind, "id": id, "size": m.size, "error": null })
+                }
+                Hashing::Changing => item_error(
+                    &path,
+                    &fail(
+                        "changing",
+                        format!("{} changed while being read", path.display()),
+                    ),
+                ),
+                Hashing::Failed(e) => item_error(&path, &fail("unreadable", e)),
+            });
+        }
+        Ok(json!(
+            out.into_iter()
+                .map(Option::unwrap_or_default)
+                .collect::<Vec<_>>()
+        ))
+    }
+
+    /// Reread `path` in full and record what it holds, whatever the stored
+    /// stat says; `id` is what the caller believed it held.
+    async fn verify(&self, id: &str, path: &Path, reason: &str) -> Result<Value> {
+        let claimed = parse_id(id)?;
+        if !path.is_absolute() {
+            return Err(fail(
+                "invalid_params",
+                format!("{} is not absolute", path.display()),
+            ));
+        }
+        self.require_root(path)?;
+        crate::say!(
+            1,
+            "verify {} as {}: {reason}",
+            path.display(),
+            content_hex(&claimed)
+        );
+        self.suspect
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(path.to_path_buf());
+        let _suspect = Suspect(&self.suspect, path.to_path_buf());
+        let answer = |state: &str, current: Option<String>| {
+            Ok(json!({
+                "id": content_hex(&claimed), "path": path, "state": state, "current": current,
+            }))
+        };
+        let parent = path.parent().unwrap_or(path);
+        if let Some(target) = parent.ancestors().find(|a| a.is_dir()) {
+            self.refresh_with(target, true, true).await?;
+        }
+        let m = match Meta::lstat(path) {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return answer("gone", None),
+            Err(_) => return answer("unreadable", None),
+        };
+        if m.kind != Kind::File {
+            return answer("not_file", None);
+        }
+        let conn = self.index.connect()?;
+        let before = self.index.fresh_content_id(&conn, &m).await?;
+        let mut result = Hashing::Changing;
+        for _ in 0..3 {
+            let m = Meta::lstat(path)?;
+            result = self
+                .hash_now(vec![(path.to_path_buf(), m)])
+                .await?
+                .remove(0);
+            if !matches!(result, Hashing::Changing) {
+                break;
+            }
+        }
+        let m = Meta::lstat(path)?;
+        match result {
+            Hashing::Changing => Err(fail(
+                "changing",
+                format!("{} keeps changing while being read", path.display()),
+            )),
+            Hashing::Failed(e) => {
+                crate::say!(0, "verify {}: {e}", path.display());
+                self.index.forget_content_id(&conn, m.dev, m.ino).await?;
+                if let Some(root) = before {
+                    for p in self.inode_paths(&conn, &m).await? {
+                        self.lost(&root, &p, "unreadable");
+                    }
+                }
+                answer("unreadable", None)
+            }
+            Hashing::Done(None) => {
+                self.index.forget_content_id(&conn, m.dev, m.ino).await?;
+                if let Some(root) = before {
+                    for p in self.inode_paths(&conn, &m).await? {
+                        self.lost(&root, &p, "changed");
+                    }
+                }
+                answer("changed", None)
+            }
+            Hashing::Done(Some(h)) => {
+                let now = h.id.root;
+                if before.as_deref().is_some_and(|b| b != now.as_slice()) {
+                    let old = before.clone().unwrap_or_default();
+                    for p in self.inode_paths(&conn, &m).await? {
+                        self.lost(&old, &p, "changed");
+                    }
+                }
+                self.record_hash(&conn, path, &m, &h).await?;
+                if now == claimed {
+                    answer("unchanged", Some(content_hex(&now)))
+                } else {
+                    crate::say!(
+                        0,
+                        "verify {}: holds {}, not {}",
+                        path.display(),
+                        content_hex(&now),
+                        content_hex(&claimed)
+                    );
+                    answer("changed", Some(content_hex(&now)))
+                }
+            }
+        }
+    }
+
+    async fn inode_paths(&self, conn: &turso::Connection, m: &Meta) -> Result<Vec<PathBuf>> {
+        let mut cache = HashMap::new();
+        let mut out = Vec::new();
+        for e in self.index.inode_entries(conn, m.dev, m.ino).await? {
+            out.push(self.index.path_of(conn, e, &mut cache).await?);
+        }
+        Ok(out)
+    }
+
+    fn lost(&self, root: &[u8], path: &Path, reason: &str) {
+        self.events.emit(
+            "content.lost",
+            json!({ "id": content_hex(root), "path": path, "reason": reason }),
+        );
+    }
+
+    /// Store a fresh hash of `path`, link its entry and announce it if the
+    /// path was not already an observation of that content.
+    async fn record_hash(
+        &self,
+        conn: &turso::Connection,
+        path: &Path,
+        m: &Meta,
+        h: &steward_contentid::Hashed,
+    ) -> Result<()> {
+        let before = self.index.fresh_content_id(conn, m).await?;
+        self.save_hash(conn, m, h).await?;
+        let mut paths = Vec::new();
+        let mut cache = HashMap::new();
+        if let Some(entry) = self.index.resolve(conn, path).await? {
+            self.index.link_content(conn, entry, m).await?;
+        }
+        for e in self.index.inode_entries(conn, m.dev, m.ino).await? {
+            paths.push(self.index.path_of(conn, e, &mut cache).await?);
+        }
+        if before.as_deref() != Some(h.id.root.as_slice()) {
+            for p in paths {
+                self.events.emit(
+                    "content.observed",
+                    json!({ "id": content_hex(&h.id.root), "path": p }),
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Hash `files` now on the hashing pool, in order.
+    async fn hash_now(&self, files: Vec<(PathBuf, Meta)>) -> Result<Vec<Hashing>> {
+        if files.is_empty() {
+            return Ok(Vec::new());
+        }
+        let pool = std::sync::Arc::clone(
+            &self
+                .hash_pool
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        Ok(tokio::task::spawn_blocking(move || {
+            use rayon::prelude::*;
+            pool.install(|| {
+                files
+                    .par_iter()
+                    .map(|(p, m)| match steward_contentid::hash_file(p) {
+                        Ok(_) if Meta::lstat(p).ok().as_ref() != Some(m) => Hashing::Changing,
+                        Ok(h) => Hashing::Done(h),
+                        Err(e) => Hashing::Failed(format!("{}: {e}", p.display())),
+                    })
+                    .collect()
+            })
+        })
+        .await?)
+    }
+
+    /// Announce what a scan changed: content observed, lost or moved, and
+    /// volumes found offline or back.
+    fn publish_scan(&self, stats: &ScanStats, was_offline: &[PathBuf]) {
+        let mut observed: HashMap<(u64, u64, &[u8]), Vec<&Path>> = HashMap::new();
+        for c in &stats.content {
+            if c.kind == ChangeKind::Observed {
+                observed
+                    .entry((c.dev, c.ino, &c.root))
+                    .or_default()
+                    .push(&c.path);
+            }
+        }
+        for c in &stats.content {
+            match c.kind {
+                ChangeKind::Deleted => {
+                    match observed
+                        .get_mut(&(c.dev, c.ino, c.root.as_slice()))
+                        .and_then(Vec::pop)
+                    {
+                        Some(to) => self.events.emit(
+                            "content.moved",
+                            json!({ "id": content_hex(&c.root), "from": c.path, "to": to }),
+                        ),
+                        None => self.lost(&c.root, &c.path, "deleted"),
+                    }
+                }
+                ChangeKind::Changed => self.lost(&c.root, &c.path, "changed"),
+                ChangeKind::Observed => {}
+            }
+        }
+        for ((_, _, root), paths) in observed {
+            for p in paths {
+                self.events.emit(
+                    "content.observed",
+                    json!({ "id": content_hex(root), "path": p }),
+                );
+            }
+        }
+        for p in &stats.offline {
+            if !was_offline.contains(p) {
+                self.events.emit("storage.offline", json!({ "path": p }));
+            }
+        }
+        for p in was_offline {
+            if !stats.offline.contains(p) {
+                self.events.emit("storage.online", json!({ "path": p }));
+            }
+        }
     }
 
     async fn stored_id(&self, conn: &turso::Connection, r: &Record) -> Result<Option<String>> {
@@ -512,23 +1083,41 @@ impl Engine {
         let config = self.config();
         let p = path.display();
         match config.root_for(path) {
-            Some(r) if self.index.resolve(conn, &r.path).await?.is_some() => {
-                bail!(
+            Some(r) if self.index.resolve(conn, &r.path).await?.is_some() => Err(fail(
+                "not_indexed",
+                format!(
                     "{p} is not in the index: nothing by that name under root {}",
                     r.path.display()
-                )
-            }
-            Some(r) => bail!(
-                "{p} is not indexed yet: root {} has not finished its first scan",
-                r.path.display()
-            ),
-            None => bail!("{p} is not indexed: no configured root covers it"),
+                ),
+            )),
+            Some(r) => Err(fail(
+                "not_indexed",
+                format!(
+                    "{p} is not indexed yet: root {} has not finished its first scan",
+                    r.path.display()
+                ),
+            )),
+            None => Err(fail(
+                "not_indexed",
+                format!("{p} is not indexed: no configured root covers it"),
+            )),
         }
     }
 
     /// Rescan, then bring the derived layers up to date for that subtree.
     pub async fn refresh(&self, path: &Path, trust_dir_mtime: bool) -> Result<ScanReport> {
-        let opts = self.scan_options(path, trust_dir_mtime);
+        self.refresh_with(path, trust_dir_mtime, false).await
+    }
+
+    /// `refresh`, optionally reading `path`'s own listing even when trusting.
+    pub async fn refresh_with(
+        &self,
+        path: &Path,
+        trust_dir_mtime: bool,
+        read_root: bool,
+    ) -> Result<ScanReport> {
+        let mut opts = self.scan_options(path, trust_dir_mtime);
+        opts.read_root = read_root;
         let kind = if trust_dir_mtime { "trusting" } else { "full" };
         if self.scan_lock.try_lock().is_err() {
             crate::say!(
@@ -552,14 +1141,18 @@ impl Engine {
                 p.display()
             );
         }
-        {
+        let was_offline = {
             let mut offline = self
                 .offline
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            offline.retain(|p| !p.starts_with(&stats.root));
+            let (under, rest): (Vec<_>, Vec<_>) =
+                offline.drain(..).partition(|p| p.starts_with(&stats.root));
+            *offline = rest;
             offline.extend(stats.offline.iter().cloned());
-        }
+            under
+        };
+        self.publish_scan(&stats, &was_offline);
         crate::say!(
             1,
             "{kind} scan of {} done in {} ms: read {} dirs, trusted {}, {} errors; load {} ms, \
@@ -666,10 +1259,7 @@ impl Engine {
             return Ok(None);
         }
         if let Some(h) = &cid {
-            self.save_hash(conn, m, h).await?;
-            if let Some(entry) = self.index.resolve(conn, path).await? {
-                self.index.link_content(conn, entry, m).await?;
-            }
+            self.record_hash(conn, path, m, h).await?;
         }
         Ok(cid.map(|h| h.id))
     }
@@ -698,7 +1288,10 @@ impl Engine {
     /// The BEP-52 piece layer of content `id` for `piece_size`, derived from
     /// the stored 1 MiB layer without reading the file.
     async fn piece_layer(&self, id: &str, piece_size: u64) -> Result<Value> {
-        let cid = ContentId::from_hex(id, 0).context("content id is 64 hex digits")?;
+        let cid = ContentId {
+            root: parse_id(id)?,
+            size: 0,
+        };
         let conn = self.index.connect()?;
         let (size, layer) = match self.index.layer(&conn, &cid.root).await? {
             Some((size, bytes)) => {
@@ -711,17 +1304,24 @@ impl Engine {
             None => match self.index.content_size(&conn, &cid.root).await? {
                 // Too small to have one: BEP 52 gives it no piece layer.
                 Some(size) if size <= steward_contentid::LAYER_PIECE => (size, Vec::new()),
-                Some(_) => bail!("no verification layer stored for {id}; hash the file again"),
-                None => bail!("unknown content {id}"),
+                Some(_) => {
+                    return Err(fail(
+                        "no_layer",
+                        format!("no verification layer stored for {id}; inspect a copy of it"),
+                    ));
+                }
+                None => return Err(fail("unknown_content", format!("unknown content {id}"))),
             },
         };
-        let hashes =
-            steward_contentid::piece_layer(&layer, size, piece_size).with_context(|| {
+        let hashes = steward_contentid::piece_layer(&layer, size, piece_size).ok_or_else(|| {
+            fail(
+                "invalid_params",
                 format!(
                     "piece size must be a power of two of at least {}",
                     steward_contentid::LAYER_PIECE
-                )
-            })?;
+                ),
+            )
+        })?;
         Ok(json!({
             "id": format!("btv2:{}", cid.to_hex()),
             "size": size,
@@ -775,7 +1375,8 @@ impl Engine {
 
         // Results stream back as each file finishes, so a restart loses at
         // most the files in flight.
-        let (tx, mut rx) = mpsc::channel::<(i64, Meta, Option<steward_contentid::Hashed>)>(256);
+        type Done = (i64, PathBuf, Meta, Option<steward_contentid::Hashed>);
+        let (tx, mut rx) = mpsc::channel::<Done>(256);
         let pool = std::sync::Arc::clone(
             &self
                 .hash_pool
@@ -810,7 +1411,7 @@ impl Engine {
                             Err(e) => crate::say!(1, "hash {}: {e}", p.display()),
                         }
                         let cid = result.ok().flatten().filter(|_| !changed);
-                        let _ = tx.blocking_send((entry, m, cid));
+                        let _ = tx.blocking_send((entry, p.clone(), m, cid));
                     });
             });
         });
@@ -822,24 +1423,35 @@ impl Engine {
         loop {
             let next = rx.recv().await;
             let done = next.is_none();
-            if let Some((entry, m, cid)) = next {
+            if let Some((entry, p, m, cid)) = next {
                 files_done += 1;
                 bytes_done += m.size;
                 if let Some(c) = cid {
-                    batch.push((entry, m, c));
+                    batch.push((entry, p, m, c));
                 }
             }
             if !batch.is_empty()
                 && (done || batch.len() >= 64 || last_flush.elapsed().as_secs() >= 5)
             {
                 let n = batch.len();
+                let mut seen = Vec::new();
                 conn.execute("BEGIN", ()).await?;
-                for (entry, m, h) in batch.drain(..) {
+                for (entry, p, m, h) in batch.drain(..) {
+                    let before = self.index.fresh_content_id(&conn, &m).await?;
                     self.save_hash(&conn, &m, &h).await?;
                     self.index.link_content(&conn, entry, &m).await?;
+                    if before.as_deref() != Some(h.id.root.as_slice()) {
+                        seen.push((p, h.id.root));
+                    }
                     hashed += 1;
                 }
                 conn.execute("COMMIT", ()).await?;
+                for (p, root) in seen {
+                    self.events.emit(
+                        "content.observed",
+                        json!({ "id": content_hex(&root), "path": p }),
+                    );
+                }
                 crate::say!(
                     2,
                     "saved {n} content ids ({hashed} so far) under {}",

@@ -1,7 +1,8 @@
 # steward design
 
 steward is a per-user service that owns one index of the filesystem and
-serves it to applications over `$XDG_RUNTIME_DIR/steward/service.socket`.
+serves it to applications over `$XDG_RUNTIME_DIR/steward/content.socket`
+(administration goes through `api.socket` next to it).
 It is deliberately the opposite of baloo/tracker: the core only knows
 *structure* (paths, stat fields, well-known classes, content identity).
 Anything content-specific — EXIF, audio tags, full text — belongs in the
@@ -103,8 +104,8 @@ are what shorter intervals (`interval_minutes`, `full_every`) choose between.
    of files in unchanged directories.
 2. **Full rescan** (every `full_every`th round). Stats every file; still
    only writes what differs.
-3. **Client invalidation.** Apps that change files send
-   `{"op":"invalidate","path":…}`; the daemon debounces for 2 s, drops paths
+3. **Client invalidation.** Apps that change files call `invalidate`
+   (or `inspect`, below, to have them handled now); the daemon debounces for 2 s, drops paths
    covered by another, and rescans the nearest surviving ancestor. The
    applications doing the writing know best what they touched.
 4. **Correctness rule:** a directory's stored mtime is only ever updated by
@@ -162,13 +163,17 @@ deliberately not compared (a rename must not re-read a film). Any write
 changes mtime and invalidates the id; restoring an old mtime after writing
 (`touch -d`) would go unnoticed, the same trade rsync's quick check makes.
 Paths are found through `content_entries` (hashed inodes only, one row per
-hard link), relinked by each hashing pass so renamed files are found again. A file that changes
+hard link). A scan that meets a new or changed file whose inode was hashed
+under its current size and mtime links it at once, so a renamed or moved
+file keeps its id without being read, and the scan reports the change (see
+events below). It looks inodes up one at a time, switching to loading every
+hashed inode once a scan meets more than 2,048 new files. A file that changes
 while being hashed is discarded and retried next pass. Only subtrees listed
 under `contentid` in the config are hashed automatically; `steward cid` and
 `steward hash` work anywhere.
 
-Queries: `find_content` (id → current paths), `duplicates` (by wasted
-bytes).
+Queries: `find_content` (id → current paths), `resolve` (below),
+`duplicates` (by wasted bytes).
 
 ### Verification layer
 
@@ -195,20 +200,102 @@ Steward only ever reads indexed files. The only files it writes are its own
 index and socket, `settings.toml` when a root change is requested, and
 qdirstat exports, which refuse to overwrite an existing file.
 
+## Content primitives
+
+What applications build on, all on `content.socket`. The test for adding
+one: it must make sense for any application, not one consumer. Steward
+knows content and where it was observed; what a consumer does with that
+(sharing it, editing it, deduplicating it) stays in the consumer.
+
+- **`resolve {contents: [{id, size?}], recheck?}`**: where each content is.
+  Per id, in request order: `state` is `present` (a copy is reachable),
+  `offline` (copies are known, all on unmounted volumes), `absent` (seen
+  before, no copy now), `unknown` (never seen) or `mismatch` (the given size
+  differs from the content's); `observations` lists
+  `{path, inode, online, offline_at, mtime_ns}`, reachable ones first (hard
+  links share `inode`); `layer` says whether the verification layer is
+  stored. `recheck` re-stats every copy first: changed or vanished copies are
+  dropped and their directories queued for rescanning, a copy that fails to
+  stat is offline if the nearest existing ancestor is an indexed directory
+  now on another filesystem.
+- **`inspect {paths}`**: these paths may have changed; bring the catalog
+  up to date for them now. For a file, the parent directory is rescanned
+  (its own listing read even when its times say nothing changed, since
+  in-place edits leave them alone; subdirectories trusted as usual), then its
+  content id established: the stored id if size and mtime still match, else
+  a hash on the hashing pool. Directories are rescanned in full; files below
+  them are hashed only by the configured policy. Answers per path
+  `{path, kind, id, size, error}`, errors typed (`not_under_root`,
+  `not_found`, `changing`, `unreadable`).
+- **`verify {id, path, reason}`**: an application has reason to think
+  `path` no longer holds `id` (it found bytes that disagree). The path is
+  withheld from `resolve` while steward rescans its directory and rereads
+  the file in full, whatever the stat says; it records what the file holds
+  and answers `unchanged`, `changed` (with `current`), `gone`, `unreadable`
+  (the inode's id is dropped) or `not_file`. `reason` is logged, never
+  interpreted. This is how silent changes behind an unchanged size and mtime
+  are caught.
+- **`piece_layer {id, piece_size}`**: a stored part of the content's own
+  hash tree (above).
+
+None of them writes to a file. The worst a client can do is make steward
+read and hash files under its roots.
+
+### Events
+
+`subscribe {since?, ids?}` turns on events for a connection; `unsubscribe`
+stops them. Each arrives as an `event` notification
+`{seq, time, name, data}`:
+
+| name | data | from |
+|---|---|---|
+| `content.observed` | `{id, path}` | a scan linking a hashed inode at a new path, or a hash |
+| `content.moved` | `{id, from, to}` | one scan losing and gaining the same hashed inode |
+| `content.lost` | `{id, path, reason}` | `deleted`, `changed` (new stat, or a reread disagreed), `unreadable` |
+| `storage.offline` | `{path}` | a scan finding a known directory's volume unmounted |
+| `storage.online` | `{path}` | a scan finding it back |
+| `storage.unindexed` | `{path}` | a root removed from the configuration |
+
+`ids` filters `content.*` events; `storage.*` always arrive, and carry the
+directory only. Events are as timely as what produces them: a periodic
+scan, an `invalidate`, an `inspect` or a `verify` (there is no inotify).
+
+The daemon numbers events and keeps the last 4,096 in memory. `since`
+replays those after it; the subscribe result `{epoch, seq, complete}` says
+whether the replay reached back that far. `epoch` changes on every daemon
+start, when earlier `seq`s mean nothing. A subscriber that falls more than
+1,024 events behind gets a `gap` notification `{after}`. After any gap a
+client resolves what it tracks again.
+
 ## Protocol
 
-One JSON object per line, one response per request:
-`{"op":"children","path":"/home/me"}` →
-`{"status":"ok","result":[…]}`. Ops: `status`, `scan`, `invalidate`, `stat`,
-`children`, `locate`, `classify`, `content_id`, `hash_tree`, `find_content`,
-`duplicates`, `content_summary`, `export_qdirstat`, and settings management:
-`settings`, `put_root`, `remove_root`, `reload`. Settings changes are
-validated by the daemon, written into settings.toml with comments kept
-(`toml_edit`), and applied at once, so applications manage roots the same way
-a person editing the file does. Debug with
-`socat - UNIX-CONNECT:$XDG_RUNTIME_DIR/steward/service.socket`.
-The socket directory is `0700`. varlink is an obvious later option since it's
-the same framing idea with an interface description.
+JSON-RPC 2.0, one message per line, on two Unix sockets in
+`$XDG_RUNTIME_DIR/steward/` (directory `0700`). The split is by capability,
+not by client:
+
+- `content.socket`, for applications: `status`, `stat`, `children`, `locate`,
+  `content_id`, `find_content`, `duplicates`, `content_summary`,
+  `piece_layer`, `resolve`, `inspect`, `verify`, `invalidate`, `subscribe`,
+  `unsubscribe`.
+- `api.socket`, administration: all of those, plus `scan`, `classify`,
+  `hash_tree`, `export_qdirstat` and settings management (`settings`,
+  `put_root`, `remove_root`, `reload`). Settings changes are validated by
+  the daemon, written into settings.toml with comments kept (`toml_edit`),
+  and applied at once.
+
+`{"jsonrpc":"2.0","id":1,"method":"stat","params":{"path":"/home/me"}}` →
+`{"jsonrpc":"2.0","id":1,"result":{…}}`. Requests on one connection run
+concurrently; match responses by `id`. Errors are
+`{code, message, data: {type}}`, where `type` is stable for programs:
+`parse_error`, `invalid_request`, `method_not_found`, `invalid_params`,
+`forbidden` (an administration method on `content.socket`), `not_indexed`,
+`not_under_root`, `unknown_content`, `no_layer`, `changing`, `failed`. Debug
+with `steward raw METHOD '{…}'` or
+`socat - UNIX-CONNECT:$XDG_RUNTIME_DIR/steward/content.socket`.
+
+`python/steward_client.py` is a standard-library client: blocking and
+asyncio, typed results for the content primitives, and an event stream that
+reconnects, resumes from the last `seq` and yields a `Gap` when it can't.
 
 ## Configuration
 
@@ -251,3 +338,6 @@ in `steward-index`.
   caller's permissions (`SO_PEERCRED`).
 - Paths in JSON are converted lossily; non-UTF-8 names need a byte-safe
   encoding on the wire.
+- The event backlog lives in memory: a daemon restart is always a gap.
+- Offline handling is tested by faking a directory's stored fsid, not with
+  real mounts.

@@ -3,7 +3,8 @@
 A per-user filesystem index service for Linux: locate-style path index with
 qdirstat-style subtree totals, classification (git repos, ignored build
 output, caches), and BitTorrent v2 content ids — served to applications over
-`$XDG_RUNTIME_DIR/steward/service.socket`. No inotify.
+`$XDG_RUNTIME_DIR/steward/content.socket` (JSON-RPC 2.0; administration on
+`api.socket`). No inotify.
 
 See [docs/design.md](docs/design.md) for the architecture.
 

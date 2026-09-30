@@ -3,6 +3,7 @@
 
 pub mod config;
 pub mod engine;
+pub mod events;
 pub mod log;
 pub mod qdirstat;
 pub mod settings_file;

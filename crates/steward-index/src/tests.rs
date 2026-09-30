@@ -231,25 +231,51 @@ async fn content_lookup_follows_links_hardlinks_and_renames() {
     );
 
     // A rename is a new entry and bumps the inode's ctime, but keeps the
-    // content id: lookups miss the new path until the hashing pass relinks
-    // it, and never return the old one.
+    // content id: the scan links the new path at once and reports the old
+    // one gone and the new one observed, with the same inode (a move).
     fs::rename(root.join("top.txt"), root.join("moved.txt")).unwrap();
-    index.scan(&root, opts()).await.unwrap();
-    assert_eq!(paths().await, [root.join("a/also.txt")]);
-    let moved = index
-        .resolve(&conn, &root.join("moved.txt"))
-        .await
-        .unwrap()
-        .unwrap();
-    let m = index.get(&conn, moved).await.unwrap().unwrap().meta;
-    assert_eq!(
-        index.fresh_content_id(&conn, &m).await.unwrap(),
-        Some(cid.clone())
-    );
-    index.link_content(&conn, moved, &m).await.unwrap();
+    let stats = index.scan(&root, opts()).await.unwrap();
     assert_eq!(
         paths().await,
         [root.join("a/also.txt"), root.join("moved.txt")]
+    );
+    let mut changes: Vec<_> = stats
+        .content
+        .iter()
+        .map(|c| (c.kind, c.path.clone(), c.root.clone()))
+        .collect();
+    changes.sort_by_key(|c| c.1.clone());
+    assert_eq!(
+        changes,
+        [
+            (ChangeKind::Observed, root.join("moved.txt"), cid.clone()),
+            (ChangeKind::Deleted, root.join("top.txt"), cid.clone()),
+        ]
+    );
+    let inodes: HashSet<_> = stats.content.iter().map(|c| (c.dev, c.ino)).collect();
+    assert_eq!(inodes.len(), 1);
+
+    // Deleting one hard link reports that path deleted; the other stays.
+    fs::remove_file(root.join("moved.txt")).unwrap();
+    let stats = index.scan(&root, opts()).await.unwrap();
+    assert_eq!(paths().await, [root.join("a/also.txt")]);
+    assert!(
+        stats
+            .content
+            .iter()
+            .any(|c| c.kind == ChangeKind::Deleted && c.path == root.join("moved.txt"))
+    );
+
+    // Rewriting a file in place (new size and mtime) ends it as an
+    // observation of the old content.
+    fs::write(root.join("a/also.txt"), b"different bytes").unwrap();
+    let stats = index.scan(&root, opts()).await.unwrap();
+    assert!(paths().await.is_empty());
+    assert!(
+        stats
+            .content
+            .iter()
+            .any(|c| c.kind == ChangeKind::Changed && c.path == root.join("a/also.txt"))
     );
 }
 

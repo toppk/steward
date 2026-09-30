@@ -108,7 +108,7 @@ impl ContentView {
                 for f in &folders {
                     sums.push(
                         c.request(&Request::ContentSummary { path: f.clone() })
-                            .map_err(|e| e.0),
+                            .map_err(|e| e.message),
                     );
                 }
                 let dups = c
@@ -116,7 +116,7 @@ impl ContentView {
                         path: root.settings.path.clone(),
                         limit: 500,
                     })
-                    .map_err(|e| e.0)
+                    .map_err(|e| e.message)
                     .map(|v| {
                         v.as_array()
                             .into_iter()

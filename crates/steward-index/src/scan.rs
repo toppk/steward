@@ -202,6 +202,8 @@ pub struct Walker {
     /// the updatedb trick: names only change when the directory's mtime does.
     /// File size changes inside such a directory are missed until a full scan.
     pub trust_dir_mtime: bool,
+    /// A directory read even when trusted (the scan root, for `read_root`).
+    pub always_read: i64,
     pub one_filesystem: bool,
     pub counters: Arc<Counters>,
     pub tx: Sender<Listing>,
@@ -248,6 +250,7 @@ impl Walker {
             return;
         }
         let trusted = self.trust_dir_mtime
+            && id != self.always_read
             && known.is_some_and(|k| k.mtime_ns == meta.mtime_ns && k.ctime_ns == meta.ctime_ns);
 
         let mut subdirs = Vec::new();

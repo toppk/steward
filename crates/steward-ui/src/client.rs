@@ -10,7 +10,7 @@ pub fn fetch<T: Send + 'static>(
     move || {
         Client::connect()
             .map_err(|e| e.to_string())
-            .and_then(|mut c| f(&mut c).map_err(|e| e.0))
+            .and_then(|mut c| f(&mut c).map_err(|e| e.message))
     }
 }
 

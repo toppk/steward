@@ -15,6 +15,7 @@ async fn main() {
             snapshot: Arc::new(HashMap::new()),
             next_id: Arc::new(AtomicI64::new(2)),
             trust_dir_mtime: false,
+            always_read: 0,
             one_filesystem: true,
             counters: Arc::new(Counters::default()),
             tx,
