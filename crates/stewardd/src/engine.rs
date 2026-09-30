@@ -566,11 +566,13 @@ impl Engine {
                                 stale.insert(dir);
                             }
                         }
-                        Ok(_) => {
+                        // A path on another filesystem: maybe a different
+                        // volume mounted where this one was.
+                        Ok(m) if m.dev == rec.meta.dev => {
                             stale.insert(path.parent().unwrap_or(&path).to_path_buf());
                             continue;
                         }
-                        Err(_) => match self.offline_ancestor(&conn, &path).await? {
+                        Ok(_) | Err(_) => match self.offline_ancestor(&conn, &path).await? {
                             Some(dir) => offline_at = Some(dir),
                             None => {
                                 stale.insert(path.parent().unwrap_or(&path).to_path_buf());
@@ -625,26 +627,35 @@ impl Engine {
     }
 
     /// The indexed directory above `path` whose volume is not mounted now:
-    /// the nearest existing ancestor sits on another filesystem than the
-    /// index recorded.
+    /// the topmost of the existing ancestors found on another filesystem
+    /// than the index recorded, the same directory a scan reports offline.
     async fn offline_ancestor(
         &self,
         conn: &turso::Connection,
         path: &Path,
     ) -> Result<Option<PathBuf>> {
+        let mut found = None;
         for dir in path.ancestors().skip(1) {
             let Ok(m) = Meta::lstat(dir) else {
+                if found.is_some() {
+                    break;
+                }
                 continue;
             };
-            let Some(id) = self.index.resolve(conn, dir).await? else {
-                return Ok(None);
+            let moved = match self.index.resolve(conn, dir).await? {
+                Some(id) => self
+                    .index
+                    .get(conn, id)
+                    .await?
+                    .is_some_and(|r| r.meta.kind == Kind::Dir && r.meta.dev != m.dev),
+                None => false,
             };
-            let rec = self.index.get(conn, id).await?;
-            return Ok(rec
-                .filter(|r| r.meta.kind == Kind::Dir && r.meta.dev != m.dev)
-                .map(|_| dir.to_path_buf()));
+            if !moved {
+                break;
+            }
+            found = Some(dir.to_path_buf());
         }
-        Ok(None)
+        Ok(found)
     }
 
     /// Bring the catalog up to date for `paths` now and establish the
