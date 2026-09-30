@@ -196,3 +196,59 @@ async fn subtree_scan_only_loads_that_subtree() {
     let (_, files, _) = totals(&index, &root).await;
     assert_eq!(files, 4);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn content_lookup_follows_links_hardlinks_and_renames() {
+    let (_tmp, index, root) = fixture().await;
+    fs::hard_link(root.join("top.txt"), root.join("a/also.txt")).unwrap();
+    index.scan(&root, opts()).await.unwrap();
+    let conn = index.connect().unwrap();
+    let cid = b"pretend-pieces-root".to_vec();
+    let link_all = async |name: &str| {
+        let id = index
+            .resolve(&conn, &root.join(name))
+            .await
+            .unwrap()
+            .unwrap();
+        let r = index.get(&conn, id).await.unwrap().unwrap();
+        index.put_content_id(&conn, &r.meta, &cid).await.unwrap();
+        index.link_content(&conn, id, &r.meta).await.unwrap();
+    };
+    link_all("top.txt").await;
+    link_all("a/also.txt").await;
+    let paths = async || {
+        let mut cache = HashMap::new();
+        let mut out = Vec::new();
+        for id in index.find_content(&conn, &cid).await.unwrap() {
+            out.push(index.path_of(&conn, id, &mut cache).await.unwrap());
+        }
+        out.sort();
+        out
+    };
+    assert_eq!(
+        paths().await,
+        [root.join("a/also.txt"), root.join("top.txt")]
+    );
+
+    // A rename is a new entry and bumps the inode's ctime, but keeps the
+    // content id: lookups miss the new path until the hashing pass relinks
+    // it, and never return the old one.
+    fs::rename(root.join("top.txt"), root.join("moved.txt")).unwrap();
+    index.scan(&root, opts()).await.unwrap();
+    assert_eq!(paths().await, [root.join("a/also.txt")]);
+    let moved = index
+        .resolve(&conn, &root.join("moved.txt"))
+        .await
+        .unwrap()
+        .unwrap();
+    let m = index.get(&conn, moved).await.unwrap().unwrap().meta;
+    assert_eq!(
+        index.fresh_content_id(&conn, &m).await.unwrap(),
+        Some(cid.clone())
+    );
+    index.link_content(&conn, moved, &m).await.unwrap();
+    assert_eq!(
+        paths().await,
+        [root.join("a/also.txt"), root.join("moved.txt")]
+    );
+}

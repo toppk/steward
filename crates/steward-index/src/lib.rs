@@ -44,7 +44,10 @@ CREATE TABLE IF NOT EXISTS entries (
 -- was 12 s faster on a 15.7M-entry first scan but peaked 1.1 GB higher,
 -- because building (parent, name) sorts every name in memory.
 CREATE UNIQUE INDEX IF NOT EXISTS entries_parent_name ON entries(parent, name);
-CREATE INDEX IF NOT EXISTS entries_dev_ino ON entries(dev, ino);
+-- Content ids are joined to entries through content_entries, which only
+-- holds hashed files; indexing (dev, ino) on every entry cost 13% of the
+-- file and a write per row.
+DROP INDEX IF EXISTS entries_dev_ino;
 CREATE TABLE IF NOT EXISTS tags (
     entry INTEGER NOT NULL,
     source TEXT NOT NULL,
@@ -62,6 +65,14 @@ CREATE TABLE IF NOT EXISTS contentids (
     PRIMARY KEY (dev, ino)
 );
 CREATE INDEX IF NOT EXISTS contentids_root ON contentids(root);
+-- Which entries carry a hashed inode; one row per hard link, relinked by the
+-- hashing pass after renames.
+CREATE TABLE IF NOT EXISTS content_entries (
+    entry INTEGER PRIMARY KEY,
+    dev INTEGER NOT NULL,
+    ino INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS content_entries_inode ON content_entries(dev, ino);
 CREATE TABLE IF NOT EXISTS dirty (id INTEGER PRIMARY KEY);
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value INTEGER NOT NULL);
 ";
@@ -330,10 +341,12 @@ impl Inserter {
         name: Vec<u8>,
         m: &Meta,
     ) -> Result<()> {
+        // Files store no totals (0 takes no space); directories compute a
+        // file's share from size, alloc and nlink when summing.
         let (ts, ta, tf, td) = if m.kind == Kind::Dir {
             (0, 0, 0, 1)
         } else {
-            leaf_totals(m)
+            (0, 0, 0, 0)
         };
         self.params.extend([
             Value::Integer(id),
@@ -390,31 +403,25 @@ fn guarded(m: &Meta, recent_ns: i64) -> Meta {
 }
 
 async fn update_meta(conn: &Connection, id: i64, m: &Meta) -> Result<()> {
-    let mut params = vec![
-        Value::Integer(m.mode.into()),
-        Value::Integer(m.uid.into()),
-        Value::Integer(m.gid.into()),
-        Value::Integer(m.size as i64),
-        Value::Integer(m.alloc as i64),
-        Value::Integer(m.nlink as i64),
-        Value::Integer(m.dev as i64),
-        Value::Integer(m.ino as i64),
-        Value::Integer(m.mtime_ns),
-        Value::Integer(m.ctime_ns),
-        Value::Integer(id),
-    ];
-    let sql = if m.kind == Kind::Dir {
+    exec(
+        conn,
         "UPDATE entries SET mode=?1, uid=?2, gid=?3, size=?4, alloc=?5, \
-         nlink=?6, dev=?7, ino=?8, mtime_ns=?9, ctime_ns=?10 WHERE id=?11"
-    } else {
-        let (ts, ta, _, _) = leaf_totals(m);
-        params.push(Value::Integer(ts));
-        params.push(Value::Integer(ta));
-        "UPDATE entries SET mode=?1, uid=?2, gid=?3, size=?4, alloc=?5, \
-         nlink=?6, dev=?7, ino=?8, mtime_ns=?9, ctime_ns=?10, t_size=?12, \
-         t_alloc=?13 WHERE id=?11"
-    };
-    exec(conn, sql, params).await?;
+         nlink=?6, dev=?7, ino=?8, mtime_ns=?9, ctime_ns=?10 WHERE id=?11",
+        vec![
+            Value::Integer(m.mode.into()),
+            Value::Integer(m.uid.into()),
+            Value::Integer(m.gid.into()),
+            Value::Integer(m.size as i64),
+            Value::Integer(m.alloc as i64),
+            Value::Integer(m.nlink as i64),
+            Value::Integer(m.dev as i64),
+            Value::Integer(m.ino as i64),
+            Value::Integer(m.mtime_ns),
+            Value::Integer(m.ctime_ns),
+            Value::Integer(id),
+        ],
+    )
+    .await?;
     Ok(())
 }
 
@@ -885,6 +892,7 @@ impl Index {
             }
             exec(conn, "DELETE FROM entries WHERE id = ?1", (cur,)).await?;
             exec(conn, "DELETE FROM tags WHERE entry = ?1", (cur,)).await?;
+            exec(conn, "DELETE FROM content_entries WHERE entry = ?1", (cur,)).await?;
             n += 1;
         }
         Ok(n)
@@ -945,10 +953,14 @@ impl Index {
             let mut rows = query(
                 conn,
                 "SELECT e.size, e.alloc, \
-                     (SELECT coalesce(sum(t_size), 0) FROM entries WHERE parent = e.id), \
-                     (SELECT coalesce(sum(t_alloc), 0) FROM entries WHERE parent = e.id), \
-                     (SELECT coalesce(sum(t_files), 0) FROM entries WHERE parent = e.id), \
-                     (SELECT coalesce(sum(t_dirs), 0) FROM entries WHERE parent = e.id) \
+                     (SELECT coalesce(sum(CASE WHEN kind = 1 THEN t_size \
+                        ELSE size / max(nlink, 1) END), 0) FROM entries WHERE parent = e.id), \
+                     (SELECT coalesce(sum(CASE WHEN kind = 1 THEN t_alloc \
+                        ELSE alloc / max(nlink, 1) END), 0) FROM entries WHERE parent = e.id), \
+                     (SELECT coalesce(sum(CASE WHEN kind = 1 THEN t_files WHEN kind = 0 THEN 1 \
+                        ELSE 0 END), 0) FROM entries WHERE parent = e.id), \
+                     (SELECT coalesce(sum(CASE WHEN kind = 1 THEN t_dirs ELSE 0 END), 0) \
+                        FROM entries WHERE parent = e.id) \
                      FROM entries e WHERE e.id = ?1",
                 (id,),
             )
@@ -985,7 +997,6 @@ impl Index {
         let mut stored: Vec<[i64; 4]> = Vec::new();
         let mut slot: HashMap<i64, u32> = HashMap::new();
         let mut leaf_sums: HashMap<i64, [i64; 4]> = HashMap::new();
-        let mut leaf_fixes: Vec<(i64, [i64; 4])> = Vec::new();
         let mut rows = query(
             conn,
             "SELECT id, parent, kind, size, alloc, nlink, t_size, t_alloc, t_files, t_dirs \
@@ -1020,9 +1031,6 @@ impl Index {
             };
             let (a, b, c, d) = leaf_totals(&meta);
             let t = [a, b, c, d];
-            if t != was {
-                leaf_fixes.push((id, t));
-            }
             let sum = leaf_sums.entry(parent).or_default();
             for i in 0..4 {
                 sum[i] += t[i];
@@ -1085,9 +1093,6 @@ impl Index {
             }
             Ok(())
         };
-        for (id, t) in leaf_fixes {
-            write(id, t).await?;
-        }
         for i in order {
             let i = i as usize;
             let t = totals[i];
@@ -1132,6 +1137,13 @@ impl Index {
             exec(
                 &conn,
                 "DELETE FROM tags WHERE entry IN (SELECT id FROM entries WHERE parent = ?1)",
+                (cur,),
+            )
+            .await?;
+            exec(
+                &conn,
+                "DELETE FROM content_entries \
+                 WHERE entry IN (SELECT id FROM entries WHERE parent = ?1)",
                 (cur,),
             )
             .await?;
@@ -1505,13 +1517,15 @@ impl Index {
         }))
     }
 
-    /// A stored content id is only valid while the file's stat fields match
-    /// the ones it was hashed under.
+    /// A stored content id is valid while the inode's size and mtime match
+    /// the ones it was hashed under. Not ctime: renames, moves, chmod and
+    /// hard links change it without touching content, and re-reading a
+    /// renamed film is exactly what content ids exist to avoid.
     pub async fn fresh_content_id(&self, conn: &Connection, m: &Meta) -> Result<Option<Vec<u8>>> {
-        Ok(self.content_id(conn, m.dev, m.ino).await?.and_then(|c| {
-            (c.size == m.size && c.mtime_ns == m.mtime_ns && c.ctime_ns == m.ctime_ns)
-                .then_some(c.root)
-        }))
+        Ok(self
+            .content_id(conn, m.dev, m.ino)
+            .await?
+            .and_then(|c| (c.size == m.size && c.mtime_ns == m.mtime_ns).then_some(c.root)))
     }
 
     pub async fn put_content_id(&self, conn: &Connection, m: &Meta, root: &[u8]) -> Result<()> {
@@ -1547,13 +1561,26 @@ impl Index {
         Ok(out)
     }
 
+    /// Record that `entry` carries the hashed inode in `m`.
+    pub async fn link_content(&self, conn: &Connection, entry: i64, m: &Meta) -> Result<()> {
+        exec(
+            conn,
+            "INSERT OR REPLACE INTO content_entries (entry, dev, ino) VALUES (?1, ?2, ?3)",
+            (entry, m.dev as i64, m.ino as i64),
+        )
+        .await?;
+        Ok(())
+    }
+
     /// Indexed entries whose current stat still matches content `root`.
     pub async fn find_content(&self, conn: &Connection, root: &[u8]) -> Result<Vec<i64>> {
         let mut rows = query(
             conn,
-            "SELECT e.id FROM contentids c JOIN entries e \
-                 ON e.dev = c.dev AND e.ino = c.ino AND e.size = c.size \
-                 AND e.mtime_ns = c.mtime_ns AND e.ctime_ns = c.ctime_ns \
+            "SELECT e.id FROM contentids c \
+                 JOIN content_entries l ON l.dev = c.dev AND l.ino = c.ino \
+                 JOIN entries e ON e.id = l.entry \
+                 AND e.dev = c.dev AND e.ino = c.ino AND e.size = c.size \
+                 AND e.mtime_ns = c.mtime_ns \
                  WHERE c.root = ?1",
             (root.to_vec(),),
         )

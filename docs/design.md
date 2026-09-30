@@ -147,10 +147,14 @@ torrents and lets a torrent be generated from the index. Verified identical
 to libtorrent 2.0.11's `pieces root` for files from 730 B to 214 MB. Empty
 files have no id, as in BEP 52.
 
-Stored per `(dev, ino)` with the `size`, `mtime_ns`, `ctime_ns` it was
-computed under; an id is only returned while all three still match, so
-renames and moves within a filesystem keep their id for free, and any write
-invalidates it (ctime can't be forged by `touch -d`). A file that changes
+Stored per `(dev, ino)` with the `size` and `mtime_ns` it was computed
+under; an id is only returned while both still match. Renames and moves
+within a filesystem keep the id: they change the inode's ctime, which is
+deliberately not compared (a rename must not re-read a film). Any write
+changes mtime and invalidates the id; restoring an old mtime after writing
+(`touch -d`) would go unnoticed, the same trade rsync's quick check makes.
+Paths are found through `content_entries` (hashed inodes only, one row per
+hard link), relinked by each hashing pass so renamed files are found again. A file that changes
 while being hashed is discarded and retried next pass. Only subtrees listed
 under `contentid` in the config are hashed automatically; `steward cid` and
 `steward hash` work anywhere.

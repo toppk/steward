@@ -155,8 +155,12 @@ pub fn entry(r: &Record, path: &Path, tags: Vec<String>) -> Entry {
         mtime: m.mtime_ns / 1_000_000_000,
         total_size: if leaf { m.size } else { r.t_size },
         total_alloc: if leaf { m.alloc } else { r.t_alloc },
-        total_files: r.t_files,
-        total_dirs: r.t_dirs,
+        total_files: if leaf {
+            u64::from(m.kind == Kind::File)
+        } else {
+            r.t_files
+        },
+        total_dirs: if leaf { 0 } else { r.t_dirs },
         tags,
         category: leaf
             .then(|| steward_classify::category(&r.name))
@@ -635,6 +639,9 @@ impl Engine {
         }
         if let Some(c) = cid {
             self.index.put_content_id(conn, m, &c.root).await?;
+            if let Some(entry) = self.index.resolve(conn, path).await? {
+                self.index.link_content(conn, entry, m).await?;
+            }
         }
         Ok(cid)
     }
@@ -643,16 +650,26 @@ impl Engine {
         let conn = self.index.connect()?;
         let id = self.resolve(&conn, path).await?;
         let mut stale = Vec::new();
+        let mut current = Vec::new();
         for (r, p) in self.index.subtree(&conn, id, path).await? {
-            if r.meta.kind == Kind::File
-                && r.meta.size > 0
-                && self.index.fresh_content_id(&conn, &r.meta).await?.is_none()
-            {
-                stale.push((p, r.meta));
+            if r.meta.kind != Kind::File || r.meta.size == 0 {
+                continue;
+            }
+            if self.index.fresh_content_id(&conn, &r.meta).await?.is_none() {
+                stale.push((p, r.meta, r.id));
+            } else {
+                current.push((r.id, r.meta));
             }
         }
+        // Already-hashed files may have been renamed (new entry, same inode)
+        // since they were linked; relinking is cheap and keeps lookups exact.
+        conn.execute("BEGIN", ()).await?;
+        for (entry, m) in &current {
+            self.index.link_content(&conn, *entry, m).await?;
+        }
+        conn.execute("COMMIT", ()).await?;
         let files_total = stale.len() as u64;
-        let bytes_total: u64 = stale.iter().map(|(_, m)| m.size).sum();
+        let bytes_total: u64 = stale.iter().map(|(_, m, _)| m.size).sum();
         crate::say!(
             1,
             "hashing {files_total} files ({}) under {}",
@@ -670,7 +687,7 @@ impl Engine {
 
         // Results stream back as each file finishes, so a restart loses at
         // most the files in flight.
-        let (tx, mut rx) = mpsc::channel::<(Meta, Option<steward_contentid::ContentId>)>(256);
+        let (tx, mut rx) = mpsc::channel::<(i64, Meta, Option<steward_contentid::ContentId>)>(256);
         let pool = std::sync::Arc::clone(
             &self
                 .hash_pool
@@ -680,27 +697,33 @@ impl Engine {
         let walk = tokio::task::spawn_blocking(move || {
             use rayon::prelude::*;
             pool.install(|| {
-                stale.into_par_iter().for_each_with(tx, |tx, (p, m)| {
-                    let t = std::time::Instant::now();
-                    let result = steward_contentid::hash_file(&p);
-                    let changed = Meta::lstat(&p).ok() != Some(m);
-                    let secs = t.elapsed().as_secs_f64();
-                    match &result {
-                        Ok(_) if changed => {
-                            crate::say!(2, "hash {}: changed while reading, skipped", p.display());
+                stale
+                    .into_par_iter()
+                    .for_each_with(tx, |tx, (p, m, entry)| {
+                        let t = std::time::Instant::now();
+                        let result = steward_contentid::hash_file(&p);
+                        let changed = Meta::lstat(&p).ok() != Some(m);
+                        let secs = t.elapsed().as_secs_f64();
+                        match &result {
+                            Ok(_) if changed => {
+                                crate::say!(
+                                    2,
+                                    "hash {}: changed while reading, skipped",
+                                    p.display()
+                                );
+                            }
+                            Ok(_) => crate::say!(
+                                2,
+                                "hashed {} ({}) in {secs:.1} s, {:.0} MB/s",
+                                p.display(),
+                                gib(m.size),
+                                m.size as f64 / secs.max(1e-3) / 1e6
+                            ),
+                            Err(e) => crate::say!(1, "hash {}: {e}", p.display()),
                         }
-                        Ok(_) => crate::say!(
-                            2,
-                            "hashed {} ({}) in {secs:.1} s, {:.0} MB/s",
-                            p.display(),
-                            gib(m.size),
-                            m.size as f64 / secs.max(1e-3) / 1e6
-                        ),
-                        Err(e) => crate::say!(1, "hash {}: {e}", p.display()),
-                    }
-                    let cid = result.ok().flatten().filter(|_| !changed);
-                    let _ = tx.blocking_send((m, cid));
-                });
+                        let cid = result.ok().flatten().filter(|_| !changed);
+                        let _ = tx.blocking_send((entry, m, cid));
+                    });
             });
         });
 
@@ -711,11 +734,11 @@ impl Engine {
         loop {
             let next = rx.recv().await;
             let done = next.is_none();
-            if let Some((m, cid)) = next {
+            if let Some((entry, m, cid)) = next {
                 files_done += 1;
                 bytes_done += m.size;
                 if let Some(c) = cid {
-                    batch.push((m, c));
+                    batch.push((entry, m, c));
                 }
             }
             if !batch.is_empty()
@@ -723,8 +746,9 @@ impl Engine {
             {
                 let n = batch.len();
                 conn.execute("BEGIN", ()).await?;
-                for (m, c) in batch.drain(..) {
+                for (entry, m, c) in batch.drain(..) {
                     self.index.put_content_id(&conn, &m, &c.root).await?;
+                    self.index.link_content(&conn, entry, &m).await?;
                     hashed += 1;
                 }
                 conn.execute("COMMIT", ()).await?;
