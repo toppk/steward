@@ -40,6 +40,9 @@ CREATE TABLE IF NOT EXISTS entries (
     t_files INTEGER NOT NULL DEFAULT 0,
     t_dirs INTEGER NOT NULL DEFAULT 0
 );
+-- Kept live even while loading an empty index: dropping and rebuilding them
+-- was 12 s faster on a 15.7M-entry first scan but peaked 1.1 GB higher,
+-- because building (parent, name) sorts every name in memory.
 CREATE UNIQUE INDEX IF NOT EXISTS entries_parent_name ON entries(parent, name);
 CREATE INDEX IF NOT EXISTS entries_dev_ino ON entries(dev, ino);
 CREATE TABLE IF NOT EXISTS tags (
@@ -70,19 +73,6 @@ const TOTALS_VERSION: i64 = 2;
 /// Past this many directories to re-total, one pass over the whole table
 /// beats a query per directory.
 const FULL_AGGREGATE_OVER: usize = 50_000;
-
-/// Secondary indexes on `entries`, as (name, definition); these must match
-/// SCHEMA, which recreates any that are missing.
-const BULK_INDEXES: [(&str, &str); 2] = [
-    (
-        "entries_parent_name",
-        "CREATE UNIQUE INDEX IF NOT EXISTS entries_parent_name ON entries(parent, name);",
-    ),
-    (
-        "entries_dev_ino",
-        "CREATE INDEX IF NOT EXISTS entries_dev_ino ON entries(dev, ino);",
-    ),
-];
 
 const ENTRY_COLS: &str = "id, parent, name, kind, mode, uid, gid, size, \
     alloc, nlink, dev, ino, mtime_ns, ctime_ns, t_size, t_alloc, t_files, t_dirs";
@@ -301,7 +291,6 @@ const INSERT_BATCH: usize = 256;
 /// the database; only one scan writes at a time, so they cannot collide.
 struct Inserter {
     next_id: Arc<AtomicI64>,
-    first_id: i64,
     rows: usize,
     params: Vec<Value>,
 }
@@ -316,7 +305,6 @@ impl Inserter {
         };
         Ok(Self {
             next_id: Arc::new(AtomicI64::new(max + 1)),
-            first_id: max + 1,
             rows: 0,
             params: Vec::with_capacity(INSERT_BATCH * INSERT_COLS),
         })
@@ -658,10 +646,6 @@ impl Index {
         });
 
         let ins = Inserter::new(&conn).await?;
-        // Loading an empty index: keeping secondary indexes current row by
-        // row costs more than building them once at the end. A crash leaves
-        // them missing, and `open` recreates them.
-        let bulk = ins.first_id == 1;
         let root_id = known_root.unwrap_or_else(|| ins.next_id.fetch_add(1, Ordering::Relaxed));
         let snapshot = Arc::new(snapshot);
         let mut parents: HashMap<i64, i64> =
@@ -713,11 +697,6 @@ impl Index {
             w.dirty.set.insert(int(&row, 0)?);
         }
         drop(rows);
-        if bulk {
-            for index in BULK_INDEXES {
-                exec(&conn, format!("DROP INDEX IF EXISTS {}", index.0), ()).await?;
-            }
-        }
         let mut pending: u64 = 0;
         let write_started = Instant::now();
         let mut last_report = Instant::now();
@@ -768,17 +747,6 @@ impl Index {
             return Err(e);
         }
         walk.await?;
-        if bulk {
-            exec(&conn, "COMMIT", ()).await?;
-            let t = Instant::now();
-            for index in BULK_INDEXES {
-                conn.execute_batch(index.1).await?;
-            }
-            Progress::say(progress.as_ref(), || {
-                format!("built indexes in {} ms; {}", t.elapsed().as_millis(), rss())
-            });
-            exec(&conn, "BEGIN", ()).await?;
-        }
         let write_ms = write_started.elapsed().as_millis() as u64;
         let mut stats = w.stats;
         Progress::say(progress.as_ref(), || {
@@ -1008,35 +976,33 @@ impl Index {
     /// Recompute every total from the leaves up in one pass over the table,
     /// writing only rows whose stored totals are wrong.
     async fn full_aggregate(conn: &Connection) -> Result<()> {
-        struct Dir {
-            parent: i64,
-            own: [i64; 2],
-            stored: [i64; 4],
-        }
-        let mut dirs: HashMap<i64, Dir> = HashMap::new();
-        let mut acc: HashMap<i64, [i64; 4]> = HashMap::new();
+        // Directories live in parallel arrays by position; `slot` maps a
+        // directory id to its position. Leaf sums are keyed by parent id
+        // because a leaf can come before its directory in the table.
+        let mut ids: Vec<i64> = Vec::new();
+        let mut parent_ids: Vec<i64> = Vec::new();
+        let mut totals: Vec<[i64; 4]> = Vec::new();
+        let mut stored: Vec<[i64; 4]> = Vec::new();
+        let mut slot: HashMap<i64, u32> = HashMap::new();
+        let mut leaf_sums: HashMap<i64, [i64; 4]> = HashMap::new();
         let mut leaf_fixes: Vec<(i64, [i64; 4])> = Vec::new();
         let mut rows = query(
             conn,
-            "SELECT id, parent, kind, size, alloc, nlink, t_size, t_alloc, t_files, \
-                 t_dirs FROM entries",
+            "SELECT id, parent, kind, size, alloc, nlink, t_size, t_alloc, t_files, t_dirs \
+             FROM entries",
             (),
         )
         .await?;
         while let Some(row) = rows.next().await? {
             let (id, parent) = (int(&row, 0)?, int(&row, 1)?);
             let kind = Kind::from_i64(int(&row, 2)?);
-            let stored = [int(&row, 6)?, int(&row, 7)?, int(&row, 8)?, int(&row, 9)?];
+            let was = [int(&row, 6)?, int(&row, 7)?, int(&row, 8)?, int(&row, 9)?];
             if kind == Kind::Dir {
-                let own = [int(&row, 3)?, int(&row, 4)?];
-                dirs.insert(
-                    id,
-                    Dir {
-                        parent,
-                        own,
-                        stored,
-                    },
-                );
+                slot.insert(id, ids.len() as u32);
+                ids.push(id);
+                parent_ids.push(parent);
+                totals.push([int(&row, 3)?, int(&row, 4)?, 0, 1]);
+                stored.push(was);
                 continue;
             }
             let meta = Meta {
@@ -1054,59 +1020,86 @@ impl Index {
             };
             let (a, b, c, d) = leaf_totals(&meta);
             let t = [a, b, c, d];
-            if t != stored {
+            if t != was {
                 leaf_fixes.push((id, t));
             }
-            let slot = acc.entry(parent).or_default();
+            let sum = leaf_sums.entry(parent).or_default();
             for i in 0..4 {
-                slot[i] += t[i];
+                sum[i] += t[i];
             }
         }
         drop(rows);
 
-        let mut depth: HashMap<i64, u32> = HashMap::with_capacity(dirs.len());
-        for &id in dirs.keys() {
+        for (i, id) in ids.iter().enumerate() {
+            if let Some(sum) = leaf_sums.remove(id) {
+                for k in 0..4 {
+                    totals[i][k] += sum[k];
+                }
+            }
+        }
+        drop(leaf_sums);
+        let parent_slot: Vec<u32> = parent_ids
+            .iter()
+            .map(|p| slot.get(p).copied().unwrap_or(u32::MAX))
+            .collect();
+        drop((parent_ids, slot));
+
+        // Deepest first, so each directory adds finished totals to its parent.
+        let mut depth = vec![u32::MAX; ids.len()];
+        for start in 0..ids.len() {
             let mut chain = Vec::new();
-            let mut cur = id;
+            let mut cur = start as u32;
             let base = loop {
-                if let Some(&d) = depth.get(&cur) {
-                    break d;
+                if cur == u32::MAX {
+                    break 0;
+                }
+                if depth[cur as usize] != u32::MAX {
+                    break depth[cur as usize];
                 }
                 chain.push(cur);
-                match dirs.get(&cur) {
-                    Some(d) if d.parent != 0 => cur = d.parent,
-                    _ => break 0,
-                };
+                cur = parent_slot[cur as usize];
             };
-            for (i, c) in chain.into_iter().rev().enumerate() {
-                depth.insert(c, base + i as u32 + 1);
+            for (k, c) in chain.into_iter().rev().enumerate() {
+                depth[c as usize] = base + k as u32 + 1;
             }
         }
-        let mut order: Vec<(u32, i64)> = depth.into_iter().map(|(id, d)| (d, id)).collect();
-        order.sort_unstable_by(|a, b| b.cmp(a));
+        let mut order: Vec<u32> = (0..ids.len() as u32).collect();
+        order.sort_unstable_by_key(|&i| std::cmp::Reverse(depth[i as usize]));
+        drop(depth);
 
-        let mut dir_fixes: Vec<(i64, [i64; 4])> = Vec::new();
-        for (_, id) in order {
-            let d = &dirs[&id];
-            let kids = acc.get(&id).copied().unwrap_or_default();
-            let t = [d.own[0] + kids[0], d.own[1] + kids[1], kids[2], kids[3] + 1];
-            if t != d.stored {
-                dir_fixes.push((id, t));
-            }
-            if d.parent != 0 {
-                let slot = acc.entry(d.parent).or_default();
-                for i in 0..4 {
-                    slot[i] += t[i];
-                }
-            }
-        }
-        for (id, t) in leaf_fixes.into_iter().chain(dir_fixes) {
+        let mut written = 0usize;
+        let mut write = async |id: i64, t: [i64; 4]| -> Result<()> {
             exec(
                 conn,
                 "UPDATE entries SET t_size=?1, t_alloc=?2, t_files=?3, t_dirs=?4 WHERE id=?5",
                 (t[0], t[1], t[2], t[3], id),
             )
             .await?;
+            written += 1;
+            // Callers run this inside a transaction. Committing along the way
+            // keeps turso from holding every touched page in memory until the
+            // end; the `dirty` table still lists the work until it is done.
+            if written.is_multiple_of(COMMIT_EVERY as usize) {
+                exec(conn, "COMMIT", ()).await?;
+                exec(conn, "BEGIN", ()).await?;
+            }
+            Ok(())
+        };
+        for (id, t) in leaf_fixes {
+            write(id, t).await?;
+        }
+        for i in order {
+            let i = i as usize;
+            let t = totals[i];
+            let p = parent_slot[i];
+            if p != u32::MAX {
+                for k in 0..4 {
+                    totals[p as usize][k] += t[k];
+                }
+            }
+            if t != stored[i] {
+                write(ids[i], t).await?;
+            }
         }
         Ok(())
     }
