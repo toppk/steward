@@ -31,6 +31,7 @@ application that cares, keyed by the content ids steward provides.
 | `steward-proto` | wire types and socket path |
 | `stewardd` | the service: config, scheduling, invalidation, socket server |
 | `steward-cli` | `steward` command: `tree`, `ls`, `locate`, `dups`, `cid`, … |
+| `steward-ui` | GPUI qdirstat-style tree with locate; a plain socket client like any other app |
 
 ## Layer 1: the index
 
@@ -83,13 +84,16 @@ lives in `steward-index`, so swapping stores later touches one crate.
 inotify needs a watch per directory, overflows, and costs kernel memory
 proportional to the tree. steward instead layers cheap, bounded checks:
 
-1. **Trusting rescan** (default every 30 min). A directory's mtime/ctime
+Periodic rescans default to once a day, each one full; the checks below
+are what shorter intervals (`interval_minutes`, `full_every`) choose between.
+
+1. **Trusting rescan.** A directory's mtime/ctime
    changes whenever an entry is added, removed or renamed in it, so a
    directory whose stamps match the index is not `readdir`'d; the walk
    descends through its known subdirectories. This is the mlocate trick and
    is why a rescan of `/usr` costs 140 ms. It misses in-place size changes
    of files in unchanged directories.
-2. **Full rescan** (every 8th round, configurable). Stats every file; still
+2. **Full rescan** (every `full_every`th round). Stats every file; still
    only writes what differs.
 3. **Client invalidation.** Apps that change files send
    `{"op":"invalidate","path":…}`; the daemon debounces for 2 s, drops paths
@@ -160,27 +164,45 @@ One JSON object per line, one response per request:
 `{"op":"children","path":"/home/me"}` →
 `{"status":"ok","result":[…]}`. Ops: `status`, `scan`, `invalidate`, `stat`,
 `children`, `locate`, `classify`, `content_id`, `hash_tree`, `find_content`,
-`duplicates`. Debug with
+`duplicates`, `content_summary`, `export_qdirstat`, and settings management:
+`settings`, `put_root`, `remove_root`, `reload`. Settings changes are
+validated by the daemon, written into settings.toml with comments kept
+(`toml_edit`), and applied at once, so applications manage roots the same way
+a person editing the file does. Debug with
 `socat - UNIX-CONNECT:$XDG_RUNTIME_DIR/steward/service.socket`.
 The socket directory is `0700`. varlink is an obvious later option since it's
 the same framing idea with an interface description.
 
 ## Configuration
 
-`$XDG_CONFIG_HOME/steward/config.toml` (or `$STEWARD_CONFIG`):
+`$XDG_CONFIG_HOME/steward/settings.toml` (or `$STEWARD_CONFIG`). Roots are
+subtrees of the one `/` namespace, stored in one index; each carries its own
+policy, so layers can run on much less than layer 1 covers:
 
 ```toml
-db = "/home/me/.local/state/steward/index.db"   # default
-contentid = ["/home/me/Pictures", "/home/me/Music"]
+[[root]]
+path = "~"
+exclude = ["/down/big", "*.iso"]   # gitignore syntax, relative to the root
 
 [[root]]
-path = "/home/me"
-interval_minutes = 30   # trusting rescan period
-full_every = 8          # every Nth rescan stats every file; 0 = always
-one_filesystem = true
+path = "/home/media"
+classify = false
+contentid = ["Movies", "TV"]       # content ids only here
 ```
 
-With no config the daemon indexes `$HOME`.
+Also per root: `interval_minutes`, `full_every`, `one_filesystem`. With no
+roots the daemon indexes `$HOME`.
+
+`steward reload` (or SIGHUP) re-reads the file: new roots start scanning,
+roots whose settings changed get a full rescan (so a new exclude drops its
+entries at once), and indexed roots no configured root covers are deleted,
+also at startup. The daemon refuses to scan outside its roots, so the index
+only ever holds what the settings describe; `steward --db` works ad hoc.
+
+A single database for all roots is deliberate for now: one namespace means
+one answer to "where else is this content". Splitting per root (independent
+write locks, removal by deleting a file) stays possible because all SQL is
+in `steward-index`.
 
 ## Known gaps
 

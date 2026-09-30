@@ -1,0 +1,19 @@
+# ~/.config/steward/settings.toml — after editing: `steward reload` (or SIGHUP).
+# With no [[root]] the daemon indexes $HOME.
+# All roots share one namespace and one index; each has its own policy.
+
+# db = "~/.local/state/steward/index.db"   # default
+# hash_threads = 4   # files hashed at once for content ids; default min(CPUs/2, 4)
+
+# [[root]]
+# path = "~"
+# interval_minutes = 1440 # periodic rescan; `steward invalidate` covers changes in between
+# full_every = 1          # every Nth rescan stats every file (others trust dir mtimes); 0 or 1 = always
+# one_filesystem = true
+# classify = true         # repos, ignored build output, caches
+# exclude = ["/down/big", "*.iso", "node_modules/"]   # gitignore syntax, relative to path
+
+# [[root]]
+# path = "/home/media"
+# classify = false
+# contentid = ["Movies", "TV"]   # BitTorrent v2 content ids for these subtrees only

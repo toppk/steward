@@ -6,7 +6,7 @@ members = ["crates/*"]
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
-rust-version = "1.90"
+rust-version = "1.97"
 
 [workspace.dependencies]
 steward-proto = { path = "crates/steward-proto" }
@@ -14,7 +14,7 @@ steward-index = { path = "crates/steward-index" }
 steward-classify = { path = "crates/steward-classify" }
 steward-contentid = { path = "crates/steward-contentid" }
 anyhow = "1"
-clap = { version = "4.6", features = ["derive"] }
+clap = { version = "4.6", features = ["derive", "env"] }
 ignore = "0.4"
 rayon = "1.12"
 serde = { version = "1", features = ["derive"] }
@@ -30,3 +30,7 @@ unsafe_code = "forbid"
 
 [profile.release]
 lto = "thin"
+
+# gpui-pre-macros leaves a helper ungated in release builds (see disktree).
+[profile.release.package.gpui-pre-macros]
+debug-assertions = true

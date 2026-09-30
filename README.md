@@ -8,12 +8,24 @@ output, caches), and BitTorrent v2 content ids — served to applications over
 See [docs/design.md](docs/design.md) for the architecture.
 
 ```sh
-cargo build --release
-./target/release/stewardd &          # indexes $HOME without a config
-./target/release/steward tree ~ -d 2
-./target/release/steward locate '*.torrent'
-./target/release/steward cid some/file
-./target/release/steward dups ~/Pictures
+just deps               # once: Fedora dev packages for the GUI
+just init-config        # writes ~/.config/steward/settings.toml (all commented out)
+just daemon -v          # run stewardd in the foreground (-v: roots and state changes, -vv: connections)
+just locate '*.torrent' # in another terminal
+just tree ~ 3           # qdirstat-style tree in the terminal, depth 3
+just ui ~               # the same tree in a GPUI window (needs `just deps` once)
+just cli status         # any steward subcommand
+just install            # ~/.local/bin + systemd user unit
 ```
+
+Every `steward` subcommand also runs without the daemon against an index file
+with `--db PATH` (or `STEWARD_DB`), e.g.
+`steward --db /tmp/home.db scan ~` then
+`steward --db /tmp/home.db export-qdirstat ~ -o /tmp/home.cache.gz`
+(qdirstat 2.0 cache format, matching qdirstat's own writer line for line).
+
+`python/steward_client.py` is a single-file, stdlib-only Python client
+(`Client` and asyncio `AsyncClient`) for applications; run it directly for a
+quick look at a directory.
 
 MIT licensed.

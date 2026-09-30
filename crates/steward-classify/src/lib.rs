@@ -3,14 +3,15 @@
 //! entry they apply to and inherited by everything beneath it. File-level
 //! categories come from the name alone and are derived on read, never stored.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use ignore::Match;
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
-use steward_index::{Index, Kind, Record};
+use steward_index::{Index, Node};
 
 pub const SOURCE: &str = "classify";
 
@@ -135,11 +136,9 @@ pub fn category(name: &OsStr) -> Option<&'static str> {
 pub struct Summary {
     pub scanned: usize,
     pub tagged: usize,
-}
-
-struct Tree {
-    records: Vec<(Record, PathBuf)>,
-    children: HashMap<i64, Vec<usize>>,
+    pub load_ms: u64,
+    pub rules_ms: u64,
+    pub write_ms: u64,
 }
 
 /// Matchers in effect for a directory, outermost first.
@@ -177,83 +176,118 @@ impl IgnoreStack {
     }
 }
 
+/// Files the rules look at outside repositories; everything else they
+/// match is a directory.
+const MARKERS: &[&str] = &[
+    ".gitignore",
+    "pyvenv.cfg",
+    "package.json",
+    "Cargo.toml",
+    "pyproject.toml",
+    "setup.py",
+    "build.gradle",
+    "build.gradle.kts",
+    "CMakeLists.txt",
+    "meson.build",
+    "build.zig",
+];
+
 /// Recompute this classifier's tags for everything under `root`.
+///
+/// Only the tree's directories and marker files are loaded; a directory's
+/// full contents are read only inside git repositories, where ignore rules
+/// apply to every entry.
 pub async fn classify(index: &Index, root: &Path) -> Result<Summary> {
+    let started = std::time::Instant::now();
     let conn = index.connect()?;
     let root = std::path::absolute(root)?;
     let id = index
         .resolve(&conn, &root)
         .await?
         .with_context(|| format!("{} is not indexed", root.display()))?;
-    let records = index.subtree(&conn, id, &root).await?;
-    let mut children: HashMap<i64, Vec<usize>> = HashMap::new();
-    for (i, (r, _)) in records.iter().enumerate().skip(1) {
-        children.entry(r.parent).or_default().push(i);
+    let shape = index.nodes_under(&conn, id, MARKERS).await?;
+    let mut children: HashMap<i64, Vec<usize>> = HashMap::with_capacity(shape.len() / 4);
+    for (i, n) in shape.iter().enumerate().skip(1) {
+        children.entry(n.parent).or_default().push(i);
     }
-    let tree = Tree { records, children };
+    let dirs: HashSet<i64> = shape.iter().filter(|n| n.is_dir).map(|n| n.id).collect();
+    let load_ms = started.elapsed().as_millis() as u64;
+    let rules_started = std::time::Instant::now();
+    let shape_kids = |id: i64| -> Vec<Node> {
+        children
+            .get(&id)
+            .map_or_else(Vec::new, |k| k.iter().map(|&i| shape[i].clone()).collect())
+    };
 
     let mut tags = Vec::new();
-    let mut stack = vec![(0usize, IgnoreStack::default())];
-    while let Some((i, ctx)) = stack.pop() {
-        let (rec, path) = &tree.records[i];
-        let kids = tree.children.get(&rec.id).map_or(&[][..], Vec::as_slice);
-        let names: Vec<&str> = kids
-            .iter()
-            .filter_map(|&k| tree.records[k].0.name.to_str())
-            .collect();
-
-        let mut ctx = ctx;
-        if names.contains(&".git") {
-            tags.push((rec.id, "repo".to_string()));
+    let mut scanned = 0usize;
+    let mut stack = vec![(shape[0].clone(), root.clone(), IgnoreStack::default())];
+    while let Some((dir, path, mut ctx)) = stack.pop() {
+        let mut kids = shape_kids(dir.id);
+        let has = |kids: &[Node], n: &str| kids.iter().any(|k| &k.name[..] == n.as_bytes());
+        if has(&kids, ".git") {
+            tags.push((dir.id, "repo".to_string()));
             ctx = IgnoreStack {
                 in_repo: true,
                 matchers: vec![],
             }
             .with_file(
-                path,
+                &path,
                 &[path.join(".git/info/exclude"), path.join(".gitignore")],
             );
-        } else if ctx.in_repo && names.contains(&".gitignore") {
-            ctx = ctx.with_file(path, &[path.join(".gitignore")]);
+        } else if ctx.in_repo && has(&kids, ".gitignore") {
+            ctx = ctx.with_file(&path, &[path.join(".gitignore")]);
         }
+        if ctx.in_repo {
+            kids = index.children_nodes(&conn, dir.id).await?;
+        }
+        scanned += kids.len();
+        let names: Vec<&str> = kids
+            .iter()
+            .filter_map(|k| std::str::from_utf8(&k.name).ok())
+            .collect();
 
-        for &k in kids {
-            let (child, cpath) = &tree.records[k];
-            let is_dir = child.meta.kind == Kind::Dir;
-            let name = child.name.to_string_lossy();
-            let tag = if is_dir && name == ".git" {
+        for child in &kids {
+            let cname = String::from_utf8_lossy(&child.name);
+            let cpath = path.join(OsStr::from_bytes(&child.name));
+            let tag = if child.is_dir && cname == ".git" {
                 Some("vcs-metadata")
-            } else if is_dir {
-                let grandkids: Vec<&str> = tree
-                    .children
-                    .get(&child.id)
-                    .map_or(&[][..], Vec::as_slice)
+            } else if child.is_dir {
+                let grandkids = shape_kids(child.id);
+                let grand: Vec<&str> = grandkids
                     .iter()
-                    .filter_map(|&g| tree.records[g].0.name.to_str())
+                    .filter_map(|g| std::str::from_utf8(&g.name).ok())
                     .collect();
-                well_known(&name, &names, &grandkids, cpath)
+                well_known(&cname, &names, &grand, &cpath)
             } else {
                 None
             };
             if let Some(tag) = tag {
                 tags.push((child.id, tag.to_string()));
             }
-            let ignored = ctx.in_repo && ctx.ignored(cpath, is_dir);
+            let ignored = ctx.in_repo && ctx.ignored(&cpath, child.is_dir);
             if ignored {
                 tags.push((child.id, "ignored".to_string()));
             }
             // Below a classified or ignored directory everything inherits.
-            if is_dir && tag.is_none() && !ignored {
-                stack.push((k, ctx.clone()));
+            if child.is_dir && tag.is_none() && !ignored {
+                stack.push((child.clone(), cpath, ctx.clone()));
             }
         }
     }
+    let rules_ms = rules_started.elapsed().as_millis() as u64;
 
-    let scope: Vec<i64> = tree.records.iter().map(|(r, _)| r.id).collect();
-    index.replace_tags(&conn, SOURCE, &scope, &tags).await?;
+    let write_started = std::time::Instant::now();
+    // A tag belongs to this tree if it is on one of its directories, or on
+    // an entry directly inside one.
+    let in_scope = |id: i64, parent: i64| dirs.contains(&id) || dirs.contains(&parent);
+    index.replace_tags(&conn, SOURCE, in_scope, &tags).await?;
     Ok(Summary {
-        scanned: scope.len(),
+        scanned,
         tagged: tags.len(),
+        load_ms,
+        rules_ms,
+        write_ms: write_started.elapsed().as_millis() as u64,
     })
 }
 
