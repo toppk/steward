@@ -1396,10 +1396,10 @@ impl Engine {
         );
         let walk = tokio::task::spawn_blocking(move || {
             use rayon::prelude::*;
-            pool.install(|| {
+            let _ = pool.install(|| {
                 stale
                     .into_par_iter()
-                    .for_each_with(tx, |tx, (p, m, entry)| {
+                    .try_for_each_with(tx, |tx, (p, m, entry)| {
                         let t = std::time::Instant::now();
                         let result = steward_contentid::hash_file(&p);
                         let changed = Meta::lstat(&p).ok() != Some(m);
@@ -1422,8 +1422,9 @@ impl Engine {
                             Err(e) => crate::say!(1, "hash {}: {e}", p.display()),
                         }
                         let cid = result.ok().flatten().filter(|_| !changed);
-                        let _ = tx.blocking_send((entry, p.clone(), m, cid));
-                    });
+                        // The job is gone: stop reading instead of discarding.
+                        tx.blocking_send((entry, p.clone(), m, cid)).map_err(|_| ())
+                    })
             });
         });
 
@@ -1445,18 +1446,9 @@ impl Engine {
                 && (done || batch.len() >= 64 || last_flush.elapsed().as_secs() >= 5)
             {
                 let n = batch.len();
-                let mut seen = Vec::new();
-                conn.execute("BEGIN", ()).await?;
-                for (entry, p, m, h) in batch.drain(..) {
-                    let before = self.index.fresh_content_id(&conn, &m).await?;
-                    self.save_hash(&conn, &m, &h).await?;
-                    self.index.link_content(&conn, entry, &m).await?;
-                    if before.as_deref() != Some(h.id.root.as_slice()) {
-                        seen.push((p, h.id.root));
-                    }
-                    hashed += 1;
-                }
-                conn.execute("COMMIT", ()).await?;
+                let seen = self.save_batch(&conn, &batch).await?;
+                hashed += batch.len() as u64;
+                batch.clear();
                 for (p, root) in seen {
                     self.events.emit(
                         "content.observed",
@@ -1503,6 +1495,52 @@ impl Engine {
         walk.await?;
         self.set_hash_progress(None);
         Ok(json!({ "stale": files_total, "hashed": hashed }))
+    }
+
+    /// Store a batch of hashes in one transaction; returns the paths that
+    /// were not already observations of their content. Retried, because
+    /// another connection's commit can invalidate it, and one lost batch
+    /// must not end a job that takes days.
+    async fn save_batch(
+        &self,
+        conn: &turso::Connection,
+        batch: &[(i64, PathBuf, Meta, steward_contentid::Hashed)],
+    ) -> Result<Vec<(PathBuf, [u8; 32])>> {
+        // Reads first: a transaction that reads before writing goes stale
+        // when a scan commits in between.
+        let mut seen = Vec::new();
+        for (_, p, m, h) in batch {
+            let before = self.index.fresh_content_id(conn, m).await?;
+            if before.as_deref() != Some(h.id.root.as_slice()) {
+                seen.push((p.clone(), h.id.root));
+            }
+        }
+        let mut attempt = 0u32;
+        loop {
+            attempt += 1;
+            let result: Result<()> = async {
+                conn.execute("BEGIN", ()).await?;
+                for (entry, _, m, h) in batch {
+                    self.save_hash(conn, m, h).await?;
+                    self.index.link_content(conn, *entry, m).await?;
+                }
+                conn.execute("COMMIT", ()).await?;
+                Ok(())
+            }
+            .await;
+            match result {
+                Ok(()) => return Ok(seen),
+                Err(e) => {
+                    let _ = conn.execute("ROLLBACK", ()).await;
+                    if attempt >= 10 {
+                        return Err(e);
+                    }
+                    crate::say!(1, "saving content ids: {e:#}; retrying");
+                    tokio::time::sleep(std::time::Duration::from_millis(250 * u64::from(attempt)))
+                        .await;
+                }
+            }
+        }
     }
 
     /// The hash worker took `target` off the queue; a later scan may queue
