@@ -85,6 +85,7 @@ enum Cmd {
         #[arg(short, long, default_value_t = 10)]
         top: usize,
     },
+    /// One entry: its stat fields, subtree totals, tags and content id.
     Stat {
         path: PathBuf,
     },
@@ -94,6 +95,7 @@ enum Cmd {
         #[arg(short, long, default_value_t = 1000)]
         limit: u32,
     },
+    /// Re-run classification (repositories, build output, caches…) under PATH.
     Classify {
         path: PathBuf,
     },
@@ -148,6 +150,17 @@ enum Cmd {
     },
 }
 
+/// `println!` that ends the program quietly once stdout's reader has gone
+/// (`steward locate x | head`), instead of panicking.
+macro_rules! out {
+    ($($arg:tt)*) => {{
+        use std::io::Write as _;
+        if writeln!(std::io::stdout(), $($arg)*).is_err() {
+            std::process::exit(0);
+        }
+    }};
+}
+
 fn abs(p: PathBuf) -> Result<PathBuf> {
     Ok(std::path::absolute(p)?)
 }
@@ -187,7 +200,7 @@ fn line(e: &Entry, parent_alloc: u64, indent: usize) {
     if let Some(c) = &e.category {
         extra.push_str(c);
     }
-    println!(
+    out!(
         "{:>8} {:>5.1}% {:<10} {:>8} {}{}{}  {}",
         human(e.total_alloc),
         pct,
@@ -260,7 +273,7 @@ fn tree(c: &mut Backend, e: &Entry, depth: u32, top: usize, indent: usize) -> Re
     }
     if rest > 0 {
         let bytes: u64 = kids.iter().skip(top).map(|k| k.total_alloc).sum();
-        println!(
+        out!(
             "{:>8} {:>18} {}… {rest} more",
             human(bytes),
             "",
@@ -339,7 +352,7 @@ fn run(cli: Cli) -> Result<()> {
                 .into_iter()
                 .flatten()
             {
-                println!("{}", p.as_str().unwrap_or_default());
+                out!("{}", p.as_str().unwrap_or_default());
             }
             return Ok(());
         }
@@ -373,7 +386,7 @@ fn run(cli: Cli) -> Result<()> {
             let mut stream = client.subscribe(since, ids)?;
             eprintln!("{}", stream.start);
             for msg in &mut stream {
-                println!("{}", msg?);
+                out!("{}", msg?);
             }
             return Ok(());
         }
@@ -385,6 +398,6 @@ fn run(cli: Cli) -> Result<()> {
             c.call(&method, params)?
         }
     };
-    println!("{}", serde_json::to_string_pretty(&out)?);
+    out!("{}", serde_json::to_string_pretty(&out)?);
     Ok(())
 }
