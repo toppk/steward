@@ -232,6 +232,13 @@ fn content_socket_end_to_end() {
         .unwrap();
     assert_eq!(v["state"], "gone");
 
+    // status shows what is running, including this test's connections.
+    let activity = c.call("status", json!({})).unwrap()["activity"].clone();
+    assert!(activity["connections"].as_u64().unwrap() >= 2, "{activity}");
+    assert_eq!(activity["subscribers"], 1);
+    assert!(activity["event_seq"].as_u64().unwrap() > 0);
+    assert!(activity["reading"].is_array());
+
     // A new subscriber can replay everything since the start.
     let replay = d.content().subscribe(Some(0), None).unwrap();
     assert_eq!(replay.start["complete"], true);

@@ -117,6 +117,7 @@ fn duration(secs: f64) -> String {
 
 pub struct Engine {
     pub events: crate::events::Bus,
+    pub activity: crate::activity::Activity,
     /// Paths under `verify`: withheld from `resolve` until it answers.
     suspect: std::sync::Mutex<HashSet<PathBuf>>,
     hashing: std::sync::Mutex<Option<HashProgress>>,
@@ -251,6 +252,7 @@ impl Engine {
         crate::say!(1, "hashing uses {} threads", config.hash_threads());
         Ok(Self {
             events: crate::events::Bus::default(),
+            activity: crate::activity::Activity::default(),
             suspect: std::sync::Mutex::default(),
             hashing: std::sync::Mutex::new(None),
             offline: std::sync::Mutex::default(),
@@ -390,6 +392,7 @@ impl Engine {
                     "indexed": roots,
                     "scanning": self.scan_lock.try_lock().is_err(),
                     "hashing": self.hash_progress(),
+                    "activity": self.activity_report(),
                 })
             }
             Request::Scan {
@@ -491,6 +494,23 @@ impl Engine {
                 bail!("subscriptions belong to a connection; send them to the daemon")
             }
         })
+    }
+
+    /// What is running now, beyond the job summaries in `status`.
+    pub fn activity_report(&self) -> Value {
+        let mut report = self.activity.report();
+        let mut queued: Vec<_> = self
+            .hash_waiting
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .cloned()
+            .collect();
+        queued.sort();
+        report["hash_queue"] = json!(queued);
+        report["hashing"] = json!(self.hash_progress());
+        report["event_seq"] = json!(self.events.seq());
+        report
     }
 
     fn require_root(&self, path: &Path) -> Result<()> {
@@ -932,15 +952,21 @@ impl Engine {
                 .read()
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
         );
+        let readers = self.activity.readers();
         Ok(tokio::task::spawn_blocking(move || {
             use rayon::prelude::*;
             pool.install(|| {
                 files
                     .par_iter()
-                    .map(|(p, m)| match steward_contentid::hash_file(p) {
-                        Ok(_) if Meta::lstat(p).ok().as_ref() != Some(m) => Hashing::Changing,
-                        Ok(h) => Hashing::Done(h),
-                        Err(e) => Hashing::Failed(format!("{}: {e}", p.display())),
+                    .map(|(p, m)| {
+                        let reading = readers.start(p, m.size);
+                        let hashed = steward_contentid::hash_file(p);
+                        drop(reading);
+                        match hashed {
+                            Ok(_) if Meta::lstat(p).ok().as_ref() != Some(m) => Hashing::Changing,
+                            Ok(h) => Hashing::Done(h),
+                            Err(e) => Hashing::Failed(format!("{}: {e}", p.display())),
+                        }
                     })
                     .collect()
             })
@@ -1138,6 +1164,7 @@ impl Engine {
             );
         }
         let guard = self.scan_lock.lock().await;
+        let _scanning = self.activity.scanning(path, kind);
         crate::say!(
             1,
             "{kind} scan of {} started (excludes: {:?})",
@@ -1394,6 +1421,7 @@ impl Engine {
                 .read()
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
         );
+        let readers = self.activity.readers();
         let walk = tokio::task::spawn_blocking(move || {
             use rayon::prelude::*;
             let _ = pool.install(|| {
@@ -1401,7 +1429,9 @@ impl Engine {
                     .into_par_iter()
                     .try_for_each_with(tx, |tx, (p, m, entry)| {
                         let t = std::time::Instant::now();
+                        let reading = readers.start(&p, m.size);
                         let result = steward_contentid::hash_file(&p);
+                        drop(reading);
                         let changed = Meta::lstat(&p).ok() != Some(m);
                         let secs = t.elapsed().as_secs_f64();
                         match &result {

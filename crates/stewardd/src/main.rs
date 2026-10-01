@@ -102,6 +102,17 @@ async fn main() -> Result<()> {
     }
     {
         let engine = Arc::clone(&engine);
+        let mut usr2 = signal(SignalKind::user_defined2())?;
+        tokio::spawn(async move {
+            while usr2.recv().await.is_some() {
+                let report =
+                    serde_json::to_string_pretty(&engine.activity_report()).unwrap_or_default();
+                say!(0, "activity: {report}");
+            }
+        });
+    }
+    {
+        let engine = Arc::clone(&engine);
         let mut hup = signal(SignalKind::hangup())?;
         tokio::spawn(async move {
             while hup.recv().await.is_some() {
@@ -177,7 +188,7 @@ fn notification(method: &str, params: impl serde::Serialize) -> Vec<u8> {
 /// Starts delivering events on a connection; returns the subscribe result
 /// and the task forwarding them.
 fn subscribe(
-    engine: &Engine,
+    engine: &Arc<Engine>,
     since: Option<u64>,
     ids: Option<Vec<String>>,
     out: mpsc::Sender<Vec<u8>>,
@@ -201,8 +212,10 @@ fn subscribe(
     });
     let mut live = start.live;
     let replay = start.replay;
+    let counter = Arc::clone(engine);
     let task = tokio::spawn(async move {
         use tokio::sync::broadcast::error::RecvError;
+        let _counted = stewardd::activity::Counted::new(&counter.activity.subscribers);
         let mut last = 0;
         for r in replay {
             last = r.seq;
@@ -267,6 +280,7 @@ fn bind(socket: &Path) -> Result<UnixListener> {
 }
 
 async fn serve(engine: Arc<Engine>, stream: UnixStream, conn: u64, admin: bool) {
+    let _counted = stewardd::activity::Counted::new(&engine.activity.connections);
     let (read, mut write) = stream.into_split();
     let (out, mut outgoing) = mpsc::channel::<Vec<u8>>(1024);
     let writer = tokio::spawn(async move {

@@ -67,6 +67,11 @@ impl Bus {
         let _ = self.tx.send(record);
     }
 
+    /// The last event's number.
+    pub fn seq(&self) -> u64 {
+        *self.seq.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
     pub fn subscribe(&self, since: Option<u64>) -> Start {
         let seq = self.seq.lock().unwrap_or_else(PoisonError::into_inner);
         let backlog = self.inner.lock().unwrap_or_else(PoisonError::into_inner);

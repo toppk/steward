@@ -293,6 +293,11 @@ concurrently; match responses by `id`. Errors are
 with `steward raw METHOD '{…}'` or
 `socat - UNIX-CONNECT:$XDG_RUNTIME_DIR/steward/content.socket`.
 
+`status` includes `activity`: the scan in progress (path, mode, seconds),
+every file being read for hashing (path, size, seconds), the hash queue, the
+open connections and subscribers, and the last event's `seq`. `kill -USR2`
+writes the same report to the daemon's log.
+
 `python/steward_client.py` is a standard-library client: blocking and
 asyncio, typed results for the content primitives, and an event stream that
 reconnects, resumes from the last `seq` and yields a `Gap` when it can't.
