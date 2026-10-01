@@ -58,7 +58,7 @@ impl Bus {
             name: name.to_string(),
             data,
         });
-        crate::say!(2, "event {} {}: {}", record.seq, record.name, record.data);
+        tracing::trace!("event {} {}: {}", record.seq, record.name, record.data);
         let mut backlog = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
         if backlog.len() == BACKLOG {
             backlog.pop_front();

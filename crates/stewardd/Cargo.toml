@@ -19,9 +19,11 @@ serde_json = { workspace = true }
 steward-classify = { workspace = true }
 steward-contentid = { workspace = true }
 steward-index = { workspace = true }
+steward-log = { workspace = true }
 steward-proto = { workspace = true }
 tokio = { workspace = true }
 toml = { workspace = true }
+tracing = { workspace = true }
 turso = { workspace = true }
 toml_edit = "0.25.15"
 

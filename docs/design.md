@@ -333,6 +333,20 @@ one answer to "where else is this content". Splitting per root (independent
 write locks, removal by deleting a file) stays possible because all SQL is
 in `steward-index`.
 
+## Logging
+
+stewardd, `steward` and `steward-ui` log through `tracing` (the
+`steward-log` crate), one line per event on stderr:
+`stewardd: warning: hash{path=/home/media/TV}: saving content ids: …; retrying`.
+Errors and warnings are labelled (coloured on a terminal); spans name the
+scan, hashing job or client connection a line belongs to. The daemon logs
+at info by default, `-v` adds debug (each phase of scans and hashing),
+`-vv` trace (every file, request and event); the CLI is quiet unless
+something is wrong, and its `-v` steps up from warnings. `RUST_LOG`
+overrides both (`RUST_LOG=steward_index=trace`). When stderr is the systemd
+journal, lines carry their syslog priority and no timestamp; otherwise the
+daemon prefixes local time.
+
 ## Known gaps
 
 - `locate` matches the final name component only; full-path and faster

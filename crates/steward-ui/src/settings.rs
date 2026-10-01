@@ -16,7 +16,7 @@ use gpui_omarchy::{
 };
 use steward_proto::{Request, RootSettings};
 
-use crate::client::{RootInfo, fetch, print_line};
+use crate::client::{RootInfo, fetch, print_info, print_warning};
 use crate::format;
 
 pub enum SettingsEvent {
@@ -276,7 +276,7 @@ impl SettingsView {
                 match result {
                     Ok(v) => {
                         let msg = format!("{done}; daemon applied it: {v}");
-                        print_line("", &msg);
+                        print_info(&msg);
                         this.status = Some((Status::Success, format!("{done} and applied")));
                         if let Some(p) = then {
                             // Pick it up by its canonical path on the next load.
@@ -285,7 +285,7 @@ impl SettingsView {
                         cx.emit(SettingsEvent::Changed);
                     }
                     Err(e) => {
-                        print_line("warning: ", &e);
+                        print_warning(&e);
                         this.status = Some((Status::Error, e));
                     }
                 }

@@ -1,5 +1,5 @@
 //! Talking to stewardd from the UI: blocking calls run on the background
-//! executor, and every message the UI shows in colour is echoed to stderr.
+//! executor, and every warning the UI shows in colour is logged to stderr.
 
 use steward_proto::{Client, Entry, Error, Request, RootSettings};
 
@@ -14,13 +14,14 @@ pub fn fetch<T: Send + 'static>(
     }
 }
 
-/// Echo what a coloured status line shows, so it can be copied.
-pub fn print_line(level: &str, msg: &str) {
-    let argv0 = std::env::args().next().unwrap_or_default();
-    let name = std::path::Path::new(&argv0)
-        .file_name()
-        .map_or_else(|| "steward-ui".into(), |n| n.to_string_lossy().into_owned());
-    eprintln!("{name}: {level}{msg}");
+/// Echo a warning the UI shows in colour to stderr, so it can be copied.
+pub fn print_warning(msg: &str) {
+    tracing::warn!("{msg}");
+}
+
+/// Echo a status line the UI shows, as `print_warning` does.
+pub fn print_info(msg: &str) {
+    tracing::info!("{msg}");
 }
 
 pub fn scanning(c: &mut Client) -> Result<bool, Error> {

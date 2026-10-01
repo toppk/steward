@@ -16,6 +16,8 @@ workspace = true
 anyhow = { workspace = true }
 clap = { workspace = true, features = ["env"] }
 serde_json = { workspace = true }
+steward-log = { workspace = true }
 steward-proto = { workspace = true }
 stewardd = { path = "../stewardd" }
 tokio = { workspace = true }
+tracing = { workspace = true }

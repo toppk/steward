@@ -125,7 +125,6 @@ pub struct ScanOptions {
     /// root, which may lie above the path being scanned).
     pub exclude: Vec<String>,
     pub exclude_base: Option<PathBuf>,
-    pub progress: Option<Progress>,
     /// Directories whose times fall within this long before the scan are
     /// stored as untrusted (mlocate's guard against same-tick changes).
     pub recent_window: std::time::Duration,
@@ -141,7 +140,6 @@ impl Default for ScanOptions {
             one_filesystem: true,
             exclude: Vec::new(),
             exclude_base: None,
-            progress: None,
             recent_window: std::time::Duration::from_secs(1),
             read_root: false,
         }
@@ -270,22 +268,9 @@ async fn observed(conn: &Connection, entry: i64) -> Result<Option<(Vec<u8>, u64,
     })
 }
 
-/// Receives human-readable progress lines during a scan.
-#[derive(Clone)]
-pub struct Progress(pub Arc<dyn Fn(String) + Send + Sync>);
-
-impl std::fmt::Debug for Progress {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("Progress")
-    }
-}
-
-impl Progress {
-    fn say(opt: Option<&Self>, line: impl FnOnce() -> String) {
-        if let Some(p) = opt {
-            (p.0)(line());
-        }
-    }
+/// A progress line at trace level, formatted only when it will be shown.
+fn progress(line: impl FnOnce() -> String) {
+    tracing::trace!("{}", line());
 }
 
 /// Resident memory of this process, for progress lines ("rss 1.2 GiB").
@@ -724,7 +709,6 @@ impl Index {
         let root =
             std::fs::canonicalize(root).with_context(|| format!("resolving {}", root.display()))?;
         let conn = self.connect()?;
-        let progress = opts.progress.clone();
 
         // Where the scan root sits in the index.
         let known_root = self.resolve(&conn, &root).await?;
@@ -776,7 +760,7 @@ impl Index {
             }
         }
         let load_ms = started.elapsed().as_millis() as u64;
-        Progress::say(progress.as_ref(), || {
+        progress(|| {
             format!(
                 "loaded {} known directories in {load_ms} ms; {}",
                 snapshot.len(),
@@ -849,7 +833,7 @@ impl Index {
                 pending += w.stats.inserted + w.stats.updated + w.stats.deleted - before;
                 if last_report.elapsed() >= PROGRESS_EVERY {
                     last_report = Instant::now();
-                    Progress::say(progress.as_ref(), || {
+                    progress(|| {
                         format!(
                             "walked {} dirs ({} trusted), {} entries; wrote +{} ~{} -{}; {} \
                              directory listings waiting to be written; {}",
@@ -890,7 +874,7 @@ impl Index {
         walk.await?;
         let write_ms = write_started.elapsed().as_millis() as u64;
         let mut stats = w.stats;
-        Progress::say(progress.as_ref(), || {
+        progress(|| {
             format!(
                 "walk and writes done in {write_ms} ms: +{} ~{} -{}; {}",
                 stats.inserted,
@@ -910,9 +894,7 @@ impl Index {
                 .unwrap_or_default();
         }
         let retotalled = dirty.set.len() as u64;
-        Progress::say(progress.as_ref(), || {
-            format!("re-totalling {retotalled} directories")
-        });
+        progress(|| format!("re-totalling {retotalled} directories"));
         Self::aggregate(&conn, &mut w.parents, dirty.set).await?;
         exec(&conn, "DELETE FROM dirty", ()).await?;
         exec(&conn, "COMMIT", ()).await?;
@@ -933,7 +915,7 @@ impl Index {
         )
         .into_iter()
         .map(|(p, want, found)| {
-            Progress::say(progress.as_ref(), || {
+            progress(|| {
                 format!(
                     "{} is offline: indexed on filesystem {want:016x}, found {found:016x}; \
                      left as indexed",

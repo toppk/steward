@@ -14,11 +14,11 @@ use serde_json::{Value, json};
 use steward_proto::{JSONRPC, Request, RpcError, RpcRequest, RpcResponse, code};
 use stewardd::config::Config;
 use stewardd::engine::Engine;
-use stewardd::say;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::mpsc;
+use tracing::Instrument;
 
 /// Invalidations arriving within this window are coalesced into one rescan.
 const INVALIDATE_DEBOUNCE: Duration = Duration::from_secs(2);
@@ -26,21 +26,31 @@ const INVALIDATE_DEBOUNCE: Duration = Duration::from_secs(2);
 #[derive(Parser)]
 #[command(name = "stewardd", about = "The steward file index service", version)]
 struct Args {
-    /// -v: roots, their settings and state changes; -vv: also connections.
+    /// -v: roots, their settings and each phase of scans and hashing;
+    /// -vv: also every file, request and event. RUST_LOG overrides.
     #[arg(short, long, action = clap::ArgAction::Count)]
     verbose: u8,
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() -> std::process::ExitCode {
     let args = Args::parse();
-    stewardd::log::set_verbosity(args.verbose);
+    steward_log::init(steward_log::Level::INFO, args.verbose, true);
+    match run().await {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => {
+            tracing::error!("{e:#}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+async fn run() -> Result<()> {
     let (tx, rx) = mpsc::unbounded_channel();
     let (reload_tx, mut reload_rx) = mpsc::unbounded_channel();
     let (hash_tx, mut hash_rx) = mpsc::unbounded_channel::<PathBuf>();
     let config = Config::load()?;
-    say!(
-        1,
+    tracing::debug!(
         "settings {}, index {}",
         Config::path().display(),
         config.db.display()
@@ -60,8 +70,7 @@ async fn main() -> Result<()> {
     let listener = bind(&socket)?;
     let content_socket = steward_proto::content_socket_path();
     let content_listener = bind(&content_socket)?;
-    say!(
-        0,
+    tracing::info!(
         "listening on {} (administration) and {} (content)",
         socket.display(),
         content_socket.display()
@@ -77,15 +86,14 @@ async fn main() -> Result<()> {
                 engine.hash_started(&target);
                 let t = std::time::Instant::now();
                 let result = engine.hash_tree(&target).await;
-                say!(
-                    1,
+                tracing::debug!(
                     "hashing {} took {} s",
                     target.display(),
                     t.elapsed().as_secs()
                 );
                 match result {
-                    Ok(r) => say!(0, "content ids for {}: {r}", target.display()),
-                    Err(e) => say!(0, "hash {}: {e:#}", target.display()),
+                    Ok(r) => tracing::info!("content ids for {}: {r}", target.display()),
+                    Err(e) => tracing::error!("hash {}: {e:#}", target.display()),
                 }
             }
         });
@@ -107,7 +115,7 @@ async fn main() -> Result<()> {
             while usr2.recv().await.is_some() {
                 let report =
                     serde_json::to_string_pretty(&engine.activity_report()).unwrap_or_default();
-                say!(0, "activity: {report}");
+                tracing::info!("activity: {report}");
             }
         });
     }
@@ -117,8 +125,8 @@ async fn main() -> Result<()> {
         tokio::spawn(async move {
             while hup.recv().await.is_some() {
                 match engine.reload().await {
-                    Ok(r) => say!(0, "reloaded settings: {r}"),
-                    Err(e) => say!(0, "reload failed: {e:#}"),
+                    Ok(r) => tracing::info!("reloaded settings: {r}"),
+                    Err(e) => tracing::error!("reload failed: {e:#}"),
                 }
             }
         });
@@ -133,8 +141,9 @@ async fn main() -> Result<()> {
         next_conn += 1;
         let pid = stream.peer_cred().ok().and_then(|c| c.pid());
         let which = if admin { "api" } else { "content" };
-        say!(2, "conn {next_conn}: {which} socket opened by pid {pid:?}");
-        tokio::spawn(serve(Arc::clone(&engine), stream, next_conn, admin));
+        let span = tracing::debug_span!("conn", id = next_conn, socket = which);
+        span.in_scope(|| tracing::trace!("opened by pid {pid:?}"));
+        tokio::spawn(serve(Arc::clone(&engine), stream, admin).instrument(span));
     }
 }
 
@@ -213,44 +222,47 @@ fn subscribe(
     let mut live = start.live;
     let replay = start.replay;
     let counter = Arc::clone(engine);
-    let task = tokio::spawn(async move {
-        use tokio::sync::broadcast::error::RecvError;
-        let _counted = stewardd::activity::Counted::new(&counter.activity.subscribers);
-        let mut last = 0;
-        for r in replay {
-            last = r.seq;
-            if stewardd::events::wanted(ids.as_ref(), &r)
-                && out.send(notification("event", &*r)).await.is_err()
-            {
-                return;
+    let task = tokio::spawn(
+        async move {
+            use tokio::sync::broadcast::error::RecvError;
+            let _counted = stewardd::activity::Counted::new(&counter.activity.subscribers);
+            let mut last = 0;
+            for r in replay {
+                last = r.seq;
+                if stewardd::events::wanted(ids.as_ref(), &r)
+                    && out.send(notification("event", &*r)).await.is_err()
+                {
+                    return;
+                }
+            }
+            loop {
+                match live.recv().await {
+                    Ok(r) => {
+                        if r.seq <= last {
+                            continue;
+                        }
+                        last = r.seq;
+                        if stewardd::events::wanted(ids.as_ref(), &r)
+                            && out.send(notification("event", &*r)).await.is_err()
+                        {
+                            return;
+                        }
+                    }
+                    Err(RecvError::Lagged(_)) => {
+                        if out
+                            .send(notification("gap", json!({ "after": last })))
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                    Err(RecvError::Closed) => return,
+                }
             }
         }
-        loop {
-            match live.recv().await {
-                Ok(r) => {
-                    if r.seq <= last {
-                        continue;
-                    }
-                    last = r.seq;
-                    if stewardd::events::wanted(ids.as_ref(), &r)
-                        && out.send(notification("event", &*r)).await.is_err()
-                    {
-                        return;
-                    }
-                }
-                Err(RecvError::Lagged(_)) => {
-                    if out
-                        .send(notification("gap", json!({ "after": last })))
-                        .await
-                        .is_err()
-                    {
-                        return;
-                    }
-                }
-                Err(RecvError::Closed) => return,
-            }
-        }
-    });
+        .instrument(tracing::Span::current()),
+    );
     Ok((result, task))
 }
 
@@ -279,7 +291,7 @@ fn bind(socket: &Path) -> Result<UnixListener> {
     Ok(UnixListener::bind(socket)?)
 }
 
-async fn serve(engine: Arc<Engine>, stream: UnixStream, conn: u64, admin: bool) {
+async fn serve(engine: Arc<Engine>, stream: UnixStream, admin: bool) {
     let _counted = stewardd::activity::Counted::new(&engine.activity.connections);
     let (read, mut write) = stream.into_split();
     let (out, mut outgoing) = mpsc::channel::<Vec<u8>>(1024);
@@ -344,7 +356,7 @@ async fn serve(engine: Arc<Engine>, stream: UnixStream, conn: u64, admin: bool) 
                             let _ = out.send(reply(id.clone(), Ok(result))).await;
                         }
                         events = Some(task);
-                        say!(2, "conn {conn}: subscribed");
+                        tracing::trace!("subscribed");
                         continue;
                     }
                     Err(e) => Err(e),
@@ -359,29 +371,31 @@ async fn serve(engine: Arc<Engine>, stream: UnixStream, conn: u64, admin: bool) 
             Ok(req) => {
                 // Requests run concurrently; responses carry their ids.
                 let (engine, out) = (Arc::clone(&engine), out.clone());
-                tokio::spawn(async move {
-                    let t = std::time::Instant::now();
-                    let result = engine.handle(req).await.map_err(|e| {
-                        RpcError::new(
-                            code::FAILED,
-                            stewardd::engine::kind_of(&e),
-                            format!("{e:#}"),
-                        )
-                    });
-                    let outcome = match &result {
-                        Ok(_) => "ok".to_string(),
-                        Err(e) => format!("{}: {}", e.kind(), e.message),
-                    };
-                    say!(
-                        2,
-                        "conn {conn}: {} -> {outcome}, {} ms",
-                        truncate(&text, 200),
-                        t.elapsed().as_millis()
-                    );
-                    if let Some(id) = id {
-                        let _ = out.send(reply(id, result)).await;
+                tokio::spawn(
+                    async move {
+                        let t = std::time::Instant::now();
+                        let result = engine.handle(req).await.map_err(|e| {
+                            RpcError::new(
+                                code::FAILED,
+                                stewardd::engine::kind_of(&e),
+                                format!("{e:#}"),
+                            )
+                        });
+                        let outcome = match &result {
+                            Ok(_) => "ok".to_string(),
+                            Err(e) => format!("{}: {}", e.kind(), e.message),
+                        };
+                        tracing::trace!(
+                            "{} -> {outcome}, {} ms",
+                            truncate(&text, 200),
+                            t.elapsed().as_millis()
+                        );
+                        if let Some(id) = id {
+                            let _ = out.send(reply(id, result)).await;
+                        }
                     }
-                });
+                    .instrument(tracing::Span::current()),
+                );
                 continue;
             }
         };
@@ -394,7 +408,7 @@ async fn serve(engine: Arc<Engine>, stream: UnixStream, conn: u64, admin: bool) 
     }
     drop(out);
     let _ = writer.await;
-    say!(2, "conn {conn}: closed");
+    tracing::trace!("closed");
 }
 
 fn truncate(s: &str, max: usize) -> &str {
@@ -443,8 +457,7 @@ async fn schedule(
         };
         let full = !known || root.full_every == 0 || round.is_multiple_of(root.full_every);
         match engine.refresh(&root.path, !full).await {
-            Ok(r) => say!(
-                0,
+            Ok(r) => tracing::info!(
                 "{} scan of {}: {} entries, +{} ~{} -{} in {}ms",
                 if full { "full" } else { "trusting" },
                 r.root,
@@ -454,7 +467,7 @@ async fn schedule(
                 r.deleted,
                 r.millis
             ),
-            Err(e) => say!(0, "scan {}: {e:#}", root.path.display()),
+            Err(e) => tracing::error!("scan {}: {e:#}", root.path.display()),
         }
         round = round.wrapping_add(1);
         tokio::time::sleep(Duration::from_secs(root.interval_minutes * 60)).await;
@@ -469,14 +482,14 @@ async fn invalidation_worker(engine: Arc<Engine>, mut rx: mpsc::UnboundedReceive
             paths.push(p);
         }
         let paths = coalesce(paths);
-        say!(1, "invalidated: rescanning {paths:?}");
+        tracing::debug!("invalidated: rescanning {paths:?}");
         for path in paths {
             // The path itself may be gone; rescan the nearest survivor.
             let Some(target) = path.ancestors().find(|a| a.is_dir()) else {
                 continue;
             };
             if let Err(e) = engine.refresh(target, false).await {
-                say!(0, "invalidate {}: {e:#}", target.display());
+                tracing::error!("invalidate {}: {e:#}", target.display());
             }
         }
     }

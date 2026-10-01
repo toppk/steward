@@ -12,7 +12,7 @@ use gpui_kit::{
 use gpui_omarchy::{ActiveTheme as _, ButtonVariant, Theme, button, input, with_tooltip};
 use steward_proto::{Entry, Kind, Request};
 
-use crate::client::{fetch, print_line, scanning};
+use crate::client::{fetch, print_info, print_warning, scanning};
 use crate::format;
 
 const SCANNING: &str = "stewardd is scanning: totals here may be stale (or 0 on a root's first \
@@ -137,7 +137,7 @@ impl TreeView {
                 match result {
                     Ok((entry, scanning)) => {
                         if scanning && !this.scanning {
-                            print_line("warning: ", SCANNING);
+                            print_warning(SCANNING);
                         }
                         this.scanning = scanning;
                         if scanning {
@@ -199,12 +199,12 @@ impl TreeView {
 
     fn warn(&mut self, msg: impl Into<String>) {
         let msg = msg.into();
-        print_line("warning: ", &msg);
+        print_warning(&msg);
         self.message = Some(msg.into());
     }
 
     fn note(&mut self, msg: String) {
-        print_line("", &msg);
+        print_info(&msg);
         self.message = Some(msg.into());
     }
 

@@ -18,7 +18,7 @@ use gpui_omarchy::{
 use serde_json::Value;
 use steward_proto::Request;
 
-use crate::client::{RootInfo, fetch, print_line};
+use crate::client::{RootInfo, fetch, print_info, print_warning};
 use crate::format;
 
 pub enum ContentEvent {
@@ -148,7 +148,7 @@ impl ContentView {
                         this.dups = Some(dups);
                     }
                     Err(e) => {
-                        print_line("warning: ", &e);
+                        print_warning(&e);
                         this.dups = Some(Err(e));
                     }
                 }
@@ -172,8 +172,8 @@ impl ContentView {
             let _ = this.update(cx, |this, cx| {
                 this.hashing.remove(&folder);
                 match result {
-                    Ok(v) => print_line("", &format!("hashed {}: {v}", folder.display())),
-                    Err(e) => print_line("warning: ", &e),
+                    Ok(v) => print_info(&format!("hashed {}: {v}", folder.display())),
+                    Err(e) => print_warning(&e),
                 }
                 this.refresh(cx);
             });
@@ -202,7 +202,7 @@ impl ContentView {
             let result = task.await;
             let _ = this.update(cx, |this, cx| {
                 if let Err(e) = &result {
-                    print_line("warning: ", e);
+                    print_warning(e);
                 }
                 if this.lookup.as_ref().is_some_and(|(i, _)| *i == id) {
                     this.lookup = Some((id, Some(result)));

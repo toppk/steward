@@ -10,6 +10,7 @@ use steward_contentid::ContentId;
 use steward_index::{ChangeKind, Index, Kind, Meta, Record, ScanOptions, ScanStats};
 use steward_proto::{ContentRef, Entry, Request, ScanReport};
 use tokio::sync::{Mutex, mpsc};
+use tracing::Instrument;
 
 use crate::config::Config;
 
@@ -146,8 +147,7 @@ pub struct Engine {
 
 /// One `-v` line per root: where it is and what runs on it.
 pub fn describe_root(r: &crate::config::Root) {
-    crate::say!(
-        1,
+    tracing::debug!(
         "root {}: rescan every {} min, full every {}, one_filesystem={}, classify={}, \
          exclude={:?}, contentid={:?}",
         r.path.display(),
@@ -186,6 +186,38 @@ fn validate_root(mut r: crate::config::Root) -> Result<crate::config::Root> {
         }
     }
     Ok(r)
+}
+
+/// Run `body` in a write transaction, retrying when another connection's
+/// commit gets in the way: one lost batch must not end a job that takes days.
+async fn write_tx<F, Fut>(conn: &turso::Connection, what: &str, mut body: F) -> Result<()>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
+    let mut attempt = 0u32;
+    loop {
+        attempt += 1;
+        let result: Result<()> = async {
+            conn.execute("BEGIN", ()).await?;
+            body().await?;
+            conn.execute("COMMIT", ()).await?;
+            Ok(())
+        }
+        .await;
+        match result {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                let _ = conn.execute("ROLLBACK", ()).await;
+                if attempt >= 10 {
+                    return Err(e);
+                }
+                tracing::warn!("{what}: {e:#}; retrying ({attempt} of 9)");
+                tokio::time::sleep(std::time::Duration::from_millis(250 * u64::from(attempt)))
+                    .await;
+            }
+        }
+    }
 }
 
 pub fn report(s: &ScanStats) -> ScanReport {
@@ -249,7 +281,7 @@ pub fn entry(r: &Record, path: &Path, tags: Vec<String>) -> Entry {
 impl Engine {
     pub async fn open(config: Config) -> Result<Self> {
         let index = Index::open(&config.db).await?;
-        crate::say!(1, "hashing uses {} threads", config.hash_threads());
+        tracing::debug!("hashing uses {} threads", config.hash_threads());
         Ok(Self {
             events: crate::events::Bus::default(),
             activity: crate::activity::Activity::default(),
@@ -284,12 +316,6 @@ impl Engine {
             one_filesystem: root.is_none_or(|r| r.one_filesystem),
             exclude: root.map(|r| r.exclude.clone()).unwrap_or_default(),
             exclude_base: root.map(|r| r.path.clone()),
-            progress: crate::log::enabled(2).then(|| {
-                let path = path.display().to_string();
-                steward_index::Progress(std::sync::Arc::new(move |line| {
-                    crate::say!(2, "scan {path}: {line}");
-                }))
-            }),
             ..ScanOptions::default()
         }
     }
@@ -304,8 +330,7 @@ impl Engine {
             if !config.covers(&path) {
                 let _guard = self.scan_lock.lock().await;
                 let n = self.index.remove_root(&path).await?;
-                crate::say!(
-                    0,
+                tracing::info!(
                     "removed {} ({n} entries): no longer configured",
                     path.display()
                 );
@@ -344,7 +369,7 @@ impl Engine {
                 .write()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) =
                 build_hash_pool(new.hash_threads());
-            crate::say!(1, "hashing now uses {} threads", new.hash_threads());
+            tracing::debug!("hashing now uses {} threads", new.hash_threads());
         }
         let removed = if self.managed {
             self.prune().await?
@@ -359,8 +384,7 @@ impl Engine {
         if let Some(tx) = &self.reloaded {
             let _ = tx.send(());
         }
-        crate::say!(
-            1,
+        tracing::debug!(
             "reloaded {}: added {:?}, changed {:?}, removed {:?}",
             Config::path().display(),
             added.iter().map(|r| &r.path).collect::<Vec<_>>(),
@@ -472,7 +496,7 @@ impl Engine {
             Request::PutRoot { root } => {
                 let root = validate_root(root)?;
                 crate::settings_file::put_root(&Config::path(), &root)?;
-                crate::say!(1, "settings: put root {}", root.path.display());
+                tracing::debug!("settings: put root {}", root.path.display());
                 self.reload().await?
             }
             Request::RemoveRoot { path } => {
@@ -480,7 +504,7 @@ impl Engine {
                 if !crate::settings_file::remove_root(&Config::path(), &path)? {
                     bail!("{} is not a configured root", path.display());
                 }
-                crate::say!(1, "settings: removed root {}", path.display());
+                tracing::debug!("settings: removed root {}", path.display());
                 self.reload().await?
             }
             Request::ContentSummary { path } => self.content_summary(&path).await?,
@@ -718,7 +742,7 @@ impl Engine {
         for dir in parents {
             let target = dir.ancestors().find(|a| a.is_dir()).unwrap_or(&dir);
             if let Err(e) = self.refresh_with(target, true, true).await {
-                crate::say!(0, "inspect: scan of {}: {e:#}", target.display());
+                tracing::warn!("inspect: scan of {}: {e:#}", target.display());
             }
         }
 
@@ -804,8 +828,7 @@ impl Engine {
             ));
         }
         self.require_root(path)?;
-        crate::say!(
-            1,
+        tracing::debug!(
             "verify {} as {}: {reason}",
             path.display(),
             content_hex(&claimed)
@@ -852,7 +875,7 @@ impl Engine {
                 format!("{} keeps changing while being read", path.display()),
             )),
             Hashing::Failed(e) => {
-                crate::say!(0, "verify {}: {e}", path.display());
+                tracing::warn!("verify {}: {e}", path.display());
                 self.index.forget_content_id(&conn, m.dev, m.ino).await?;
                 if let Some(root) = before {
                     for p in self.inode_paths(&conn, &m).await? {
@@ -882,8 +905,7 @@ impl Engine {
                 if now == claimed {
                     answer("unchanged", Some(content_hex(&now)))
                 } else {
-                    crate::say!(
-                        0,
+                    tracing::warn!(
                         "verify {}: holds {}, not {}",
                         path.display(),
                         content_hex(&now),
@@ -1153,28 +1175,31 @@ impl Engine {
         trust_dir_mtime: bool,
         read_root: bool,
     ) -> Result<ScanReport> {
+        let kind = if trust_dir_mtime { "trusting" } else { "full" };
+        let span = tracing::info_span!("scan", path = %path.display(), kind = %kind);
+        self.scan_now(path, trust_dir_mtime, read_root)
+            .instrument(span)
+            .await
+    }
+
+    async fn scan_now(
+        &self,
+        path: &Path,
+        trust_dir_mtime: bool,
+        read_root: bool,
+    ) -> Result<ScanReport> {
         let mut opts = self.scan_options(path, trust_dir_mtime);
         opts.read_root = read_root;
         let kind = if trust_dir_mtime { "trusting" } else { "full" };
         if self.scan_lock.try_lock().is_err() {
-            crate::say!(
-                1,
-                "{kind} scan of {} waiting for the scan in progress",
-                path.display()
-            );
+            tracing::debug!("waiting for the scan in progress");
         }
         let guard = self.scan_lock.lock().await;
         let _scanning = self.activity.scanning(path, kind);
-        crate::say!(
-            1,
-            "{kind} scan of {} started (excludes: {:?})",
-            path.display(),
-            opts.exclude
-        );
+        tracing::debug!("started (excludes: {:?})", opts.exclude);
         let stats = self.index.scan(path, opts).await?;
         for p in &stats.offline {
-            crate::say!(
-                0,
+            tracing::warn!(
                 "{} is offline (its volume is not mounted); left as indexed",
                 p.display()
             );
@@ -1191,11 +1216,9 @@ impl Engine {
             under
         };
         self.publish_scan(&stats, &was_offline);
-        crate::say!(
-            1,
-            "{kind} scan of {} done in {} ms: read {} dirs, trusted {}, {} errors; load {} ms, \
+        tracing::debug!(
+            "done in {} ms: read {} dirs, trusted {}, {} errors; load {} ms, \
              walk+write {} ms, totals {} ms ({} dirs); {}",
-            stats.root.display(),
             stats.millis,
             stats.dirs_read,
             stats.dirs_trusted,
@@ -1210,11 +1233,9 @@ impl Engine {
         if config.root_for(&stats.root).is_none_or(|r| r.classify) {
             let t = std::time::Instant::now();
             match self.classify(&stats.root).await {
-                Ok(s) => crate::say!(
-                    1,
-                    "classified {}: {} entries, {} tags in {} ms (load {} ms, rules {} ms, \
+                Ok(s) => tracing::debug!(
+                    "classified {} entries, {} tags in {} ms (load {} ms, rules {} ms, \
                      write {} ms); {}",
-                    stats.root.display(),
                     s.scanned,
                     s.tagged,
                     t.elapsed().as_millis(),
@@ -1223,7 +1244,7 @@ impl Engine {
                     s.write_ms,
                     steward_index::rss()
                 ),
-                Err(e) => crate::say!(0, "classify {}: {e:#}", stats.root.display()),
+                Err(e) => tracing::error!("classifying: {e:#}"),
             }
         }
         drop(guard);
@@ -1236,15 +1257,15 @@ impl Engine {
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .insert(target.clone());
                     if fresh {
-                        crate::say!(1, "content ids queued for {}", target.display());
+                        tracing::debug!("content ids queued for {}", target.display());
                         let _ = tx.send(target);
                     } else {
-                        crate::say!(1, "content ids for {} already queued", target.display());
+                        tracing::debug!("content ids for {} already queued", target.display());
                     }
                 }
                 None => {
                     if let Err(e) = self.hash_tree(&target).await {
-                        crate::say!(0, "hash {}: {e:#}", target.display());
+                        tracing::error!("hash {}: {e:#}", target.display());
                     }
                 }
             }
@@ -1369,6 +1390,11 @@ impl Engine {
     }
 
     pub async fn hash_tree(&self, path: &Path) -> Result<Value> {
+        let span = tracing::info_span!("hash", path = %path.display());
+        self.hash_subtree(path).instrument(span).await
+    }
+
+    async fn hash_subtree(&self, path: &Path) -> Result<Value> {
         let conn = self.index.connect()?;
         let id = self.resolve(&conn, path).await?;
         let mut stale = Vec::new();
@@ -1389,19 +1415,17 @@ impl Engine {
         }
         // Already-hashed files may have been renamed (new entry, same inode)
         // since they were linked; relinking is cheap and keeps lookups exact.
-        conn.execute("BEGIN", ()).await?;
-        for (entry, m) in &current {
-            self.index.link_content(&conn, *entry, m).await?;
-        }
-        conn.execute("COMMIT", ()).await?;
+        let (index, current) = (&self.index, &current);
+        write_tx(&conn, "relinking content ids", || async {
+            for (entry, m) in current {
+                index.link_content(&conn, *entry, m).await?;
+            }
+            Ok(())
+        })
+        .await?;
         let files_total = stale.len() as u64;
         let bytes_total: u64 = stale.iter().map(|(_, m, _)| m.size).sum();
-        crate::say!(
-            1,
-            "hashing {files_total} files ({}) under {}",
-            gib(bytes_total),
-            path.display()
-        );
+        tracing::debug!("hashing {files_total} files ({})", gib(bytes_total));
         let started = std::time::Instant::now();
         self.set_hash_progress(Some(HashProgress {
             path: path.to_path_buf(),
@@ -1422,12 +1446,14 @@ impl Engine {
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
         );
         let readers = self.activity.readers();
+        let span = tracing::Span::current();
         let walk = tokio::task::spawn_blocking(move || {
             use rayon::prelude::*;
             let _ = pool.install(|| {
                 stale
                     .into_par_iter()
                     .try_for_each_with(tx, |tx, (p, m, entry)| {
+                        let _span = span.enter();
                         let t = std::time::Instant::now();
                         let reading = readers.start(&p, m.size);
                         let result = steward_contentid::hash_file(&p);
@@ -1436,20 +1462,18 @@ impl Engine {
                         let secs = t.elapsed().as_secs_f64();
                         match &result {
                             Ok(_) if changed => {
-                                crate::say!(
-                                    2,
+                                tracing::debug!(
                                     "hash {}: changed while reading, skipped",
                                     p.display()
                                 );
                             }
-                            Ok(_) => crate::say!(
-                                2,
+                            Ok(_) => tracing::trace!(
                                 "hashed {} ({}) in {secs:.1} s, {:.0} MB/s",
                                 p.display(),
                                 gib(m.size),
                                 m.size as f64 / secs.max(1e-3) / 1e6
                             ),
-                            Err(e) => crate::say!(1, "hash {}: {e}", p.display()),
+                            Err(e) => tracing::warn!("hash {}: {e}", p.display()),
                         }
                         let cid = result.ok().flatten().filter(|_| !changed);
                         // The job is gone: stop reading instead of discarding.
@@ -1485,11 +1509,7 @@ impl Engine {
                         json!({ "id": content_hex(&root), "path": p }),
                     );
                 }
-                crate::say!(
-                    2,
-                    "saved {n} content ids ({hashed} so far) under {}",
-                    path.display()
-                );
+                tracing::trace!("saved {n} content ids ({hashed} so far)");
                 last_flush = std::time::Instant::now();
             }
             self.set_hash_progress(Some(HashProgress {
@@ -1508,10 +1528,8 @@ impl Engine {
                 } else {
                     0.0
                 };
-                crate::say!(
-                    1,
-                    "hashing {}: {files_done}/{files_total} files, {} of {}, {:.0} MB/s, {} left",
-                    path.display(),
+                tracing::debug!(
+                    "{files_done}/{files_total} files, {} of {}, {:.0} MB/s, {} left",
                     gib(bytes_done),
                     gib(bytes_total),
                     rate / 1e6,
@@ -1528,9 +1546,7 @@ impl Engine {
     }
 
     /// Store a batch of hashes in one transaction; returns the paths that
-    /// were not already observations of their content. Retried, because
-    /// another connection's commit can invalidate it, and one lost batch
-    /// must not end a job that takes days.
+    /// were not already observations of their content.
     async fn save_batch(
         &self,
         conn: &turso::Connection,
@@ -1545,32 +1561,15 @@ impl Engine {
                 seen.push((p.clone(), h.id.root));
             }
         }
-        let mut attempt = 0u32;
-        loop {
-            attempt += 1;
-            let result: Result<()> = async {
-                conn.execute("BEGIN", ()).await?;
-                for (entry, _, m, h) in batch {
-                    self.save_hash(conn, m, h).await?;
-                    self.index.link_content(conn, *entry, m).await?;
-                }
-                conn.execute("COMMIT", ()).await?;
-                Ok(())
+        write_tx(conn, "saving content ids", || async {
+            for (entry, _, m, h) in batch {
+                self.save_hash(conn, m, h).await?;
+                self.index.link_content(conn, *entry, m).await?;
             }
-            .await;
-            match result {
-                Ok(()) => return Ok(seen),
-                Err(e) => {
-                    let _ = conn.execute("ROLLBACK", ()).await;
-                    if attempt >= 10 {
-                        return Err(e);
-                    }
-                    crate::say!(1, "saving content ids: {e:#}; retrying");
-                    tokio::time::sleep(std::time::Duration::from_millis(250 * u64::from(attempt)))
-                        .await;
-                }
-            }
-        }
+            Ok(())
+        })
+        .await?;
+        Ok(seen)
     }
 
     /// The hash worker took `target` off the queue; a later scan may queue

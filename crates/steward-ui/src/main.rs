@@ -14,6 +14,7 @@ use std::path::PathBuf;
 use gpui_kit::{AppContext as _, Bounds, WindowBounds, WindowOptions, point, px, size};
 
 fn main() {
+    steward_log::init(steward_log::Level::INFO, 0, false);
     let root = std::env::args_os()
         .nth(1)
         .map(PathBuf::from)

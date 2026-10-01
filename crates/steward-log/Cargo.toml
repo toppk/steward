@@ -1,5 +1,5 @@
 [package]
-name = "steward-index"
+name = "steward-log"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -9,13 +9,7 @@ rust-version.workspace = true
 workspace = true
 
 [dependencies]
-anyhow = { workspace = true }
-ignore = { workspace = true }
 rustix = { version = "1.1", features = ["fs"] }
-rayon = { workspace = true }
-tokio = { workspace = true }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 tracing = { workspace = true }
-turso = { workspace = true }
-
-[dev-dependencies]
-tempfile = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

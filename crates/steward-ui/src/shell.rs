@@ -11,7 +11,7 @@ use gpui_kit::{
 };
 use gpui_omarchy::{ActiveTheme as _, ButtonVariant, ChoiceItem, button, tab_list, with_tooltip};
 
-use crate::client::{RootInfo, fetch, print_line, settings};
+use crate::client::{RootInfo, fetch, print_warning, settings};
 use crate::content::{ContentEvent, ContentView};
 use crate::settings::{SettingsEvent, SettingsView};
 use crate::tree::{TreeEvent, TreeView};
@@ -168,7 +168,7 @@ impl Shell {
                         this.settings
                             .update(cx, |s, cx| s.set_roots(roots, current, file, cx));
                     }
-                    Err(e) => print_line("warning: ", &e),
+                    Err(e) => print_warning(&e),
                 }
                 cx.notify();
             });

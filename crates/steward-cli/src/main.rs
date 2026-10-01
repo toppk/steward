@@ -13,6 +13,9 @@ struct Cli {
     /// Work directly on this index file instead of through stewardd.
     #[arg(long, global = true, env = "STEWARD_DB")]
     db: Option<PathBuf>,
+    /// Log more to stderr: -v info, -vv debug, -vvv trace (RUST_LOG overrides).
+    #[arg(short, long, global = true, action = clap::ArgAction::Count)]
+    verbose: u8,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -267,8 +270,19 @@ fn tree(c: &mut Backend, e: &Entry, depth: u32, top: usize, indent: usize) -> Re
     Ok(())
 }
 
-fn main() -> Result<()> {
+fn main() -> std::process::ExitCode {
     let cli = Cli::parse();
+    steward_log::init(steward_log::Level::WARN, cli.verbose, false);
+    match run(cli) {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => {
+            tracing::error!("{e:#}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+fn run(cli: Cli) -> Result<()> {
     let mut c = Backend::open(cli.db)?;
     let out = match cli.cmd {
         Cmd::Status => c.request(&Request::Status)?,
