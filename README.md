@@ -6,7 +6,9 @@ output, caches), and BitTorrent v2 content ids — served to applications over
 `$XDG_RUNTIME_DIR/steward/content.socket` (JSON-RPC 2.0; administration on
 `api.socket`). No inotify.
 
-See [docs/design.md](docs/design.md) for the architecture.
+Documentation: <https://toppk.github.io/steward/> (sources in `site/`;
+`just docs-serve` previews it). The design notes are in
+[docs/design.md](docs/design.md).
 
 ```sh
 just deps               # once: Fedora dev packages for the GUI

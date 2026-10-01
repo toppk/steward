@@ -74,3 +74,11 @@ uninstall:
 
 logs:
     journalctl --user -u stewardd -f
+
+# Build the documentation site into _site/ (needs pandoc).
+docs:
+    site/build.sh _site
+
+# Build the site and serve it at http://localhost:8000.
+docs-serve: docs
+    python3 -m http.server -d _site 8000

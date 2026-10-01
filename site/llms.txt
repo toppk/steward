@@ -1,0 +1,28 @@
+# steward
+
+> steward is a per-user file index service for Linux. A daemon (stewardd) keeps an index of every path under the user's configured roots (lstat fields and directory subtree totals), classifies directories and files (git repositories, ignored build output, caches, file categories), and computes content ids (the BitTorrent v2 / BEP 52 Merkle root of each file's bytes). Applications query it with JSON-RPC 2.0 over Unix sockets in $XDG_RUNTIME_DIR/steward/: content.socket for applications, api.socket for administration. steward only reads the files it indexes; it never modifies them.
+
+Every page below is Markdown. llms-full.txt has all of them in one file.
+
+## Start here
+
+- [For AI agents](agents.md): compact operating guide: detecting steward, safe calls, recipes, pitfalls
+- [Overview](index.md): what steward is, its promises, how it fits together
+- [Concepts](concepts.md): roots, scans, offline volumes, classification, content ids, observations, events
+
+## Using steward
+
+- [Getting started](getting-started.md): build, install, configure, first queries
+- [Configuration](configuration.md): settings.toml keys, environment variables
+- [Command line](cli.md): every `steward` subcommand
+- [Desktop app](gui.md): steward-ui, its tabs and keys
+- [Operations](operations.md): service, logging, status and diagnostics, troubleshooting
+
+## Building on steward
+
+- [Building on steward](applications.md): patterns for applications, with Python examples
+- [API reference](api.md): transport, sockets, every method, result types, events, error types
+
+## Optional
+
+- [Design notes](design.md): internals: storage, scanning, classification, hashing

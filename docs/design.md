@@ -1,4 +1,4 @@
-# steward design
+# Design notes
 
 steward is a per-user service that owns one index of the filesystem and
 serves it to applications over `$XDG_RUNTIME_DIR/steward/content.socket`
@@ -9,8 +9,8 @@ Anything content-specific — EXIF, audio tags, full text — belongs in the
 application that cares, keyed by the content ids steward provides.
 
 ```
- apps (file manager, photo app, torrent client, qdirstat-style viewer)
-        │  JSON lines over unix socket
+ apps (file manager, photo app, backup tool, qdirstat-style viewer)
+        │  JSON-RPC 2.0 over content.socket / api.socket
  ┌──────┴───────────────────────────────────────────────────────┐
  │ stewardd                                                     │
  │  scheduler ─ invalidation queue ─ request handlers           │
@@ -29,7 +29,8 @@ application that cares, keyed by the content ids steward provides.
 | `steward-index` | L1: parallel walker, diffing writer, queries, storage for tags and content ids |
 | `steward-classify` | L2: directory classes and gitignore state → tags; file categories by extension |
 | `steward-contentid` | L3: BitTorrent v2 pieces root, no I/O policy, no DB |
-| `steward-proto` | wire types and socket path |
+| `steward-proto` | wire types, socket paths, a small blocking client |
+| `steward-log` | logging shared by the daemon, CLI and GUI (`tracing`) |
 | `stewardd` | the service: config, scheduling, invalidation, socket server |
 | `steward-cli` | `steward` command: `tree`, `ls`, `locate`, `dups`, `cid`, … |
 | `steward-ui` | GPUI qdirstat-style tree with locate; a plain socket client like any other app |
@@ -78,9 +79,9 @@ Measured on this machine (turso 0.8.1, release build):
 | build `parent` index over 1M rows | 0.7 s |
 | `name LIKE '%x%'` over 1M rows | 110 ms |
 | 1000 child listings (20k rows) | 11 ms |
-| `/usr` first scan, 753k entries | 14 s |
-| `/usr` full rescan, nothing changed | 1.6 s |
-| `/usr` trusting rescan | 0.14 s |
+| `/usr` first scan, 753k entries | 2.7 s |
+| `/usr` full rescan, nothing changed | 0.95 s |
+| `/usr` trusting rescan | 0.07 s |
 | `steward tree /usr -d 2`, `steward locate` | < 0.1 s |
 
 Readers are unaffected by a running scan. That is fast enough that an
@@ -100,7 +101,7 @@ are what shorter intervals (`interval_minutes`, `full_every`) choose between.
    changes whenever an entry is added, removed or renamed in it, so a
    directory whose stamps match the index is not `readdir`'d; the walk
    descends through its known subdirectories. This is the mlocate trick and
-   is why a rescan of `/usr` costs 140 ms. It misses in-place size changes
+   is why a rescan of `/usr` costs 70 ms. It misses in-place size changes
    of files in unchanged directories.
 2. **Full rescan** (every `full_every`th round). Stats every file; still
    only writes what differs.
@@ -151,8 +152,8 @@ that own their own `source` namespace (not yet exposed over the socket).
 
 The id is the BitTorrent v2 (BEP 52) **pieces root**: SHA-256 of each 16 KiB
 block, a binary merkle tree padded to a power of two with zero leaves. It is
-independent of piece length, so the same id identifies content across
-torrents and lets a torrent be generated from the index. Verified identical
+independent of piece length, so it is the same value any BEP 52 software
+computes for the same bytes, whatever piece size it uses. Verified identical
 to libtorrent 2.0.11's `pieces root` for files from 730 B to 214 MB. Empty
 files have no id, as in BEP 52.
 
@@ -181,9 +182,9 @@ With each content id the hashing pass keeps a **1 MiB verification layer**:
 the root of every 64-block (1 MiB) subtree of the file's BEP-52 tree, 32
 bytes per MiB (about 0.9 GB for 28 TiB), keyed by content id. Any piece
 layer for a power-of-two piece size of 1 MiB or more derives from it by
-hashing pairs upward, so a v2 torrent for already-hashed content never
-re-reads the file; `piece_layer` returns exactly the bytes of a torrent's
-`piece layers` entry (verified against libtorrent at 1, 4 and 16 MiB).
+hashing pairs upward, so no layer ever needs the file read again;
+`piece_layer` returns exactly the bytes of a v2 torrent's `piece layers`
+entry for the file (verified against libtorrent at 1, 4 and 16 MiB).
 Files of 1 MiB or less have none, as in BEP 52.
 
 ## Filesystems and offline volumes

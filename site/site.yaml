@@ -1,0 +1,13 @@
+# Project settings for the Horizon theme.
+site-title: steward
+site-tagline: a file index service for Linux applications
+site-logo: assets/logo.svg
+site-footer: 'steward is MIT licensed · <a href="https://github.com/toppk/steward">github.com/toppk/steward</a>'
+llms: llms.txt
+top-links:
+  - label: Docs
+    href: getting-started.html
+  - label: API
+    href: api.html
+  - label: GitHub
+    href: https://github.com/toppk/steward
