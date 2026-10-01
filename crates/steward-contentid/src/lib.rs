@@ -239,6 +239,26 @@ pub fn hash_file(path: &Path) -> io::Result<Option<Hashed>> {
     hash_reader_with_layer(File::open(path)?)
 }
 
+/// `hash_file`, adding the bytes read to `read` as it goes, so a caller can
+/// show progress through a large file.
+pub fn hash_file_counting(
+    path: &Path,
+    read: &std::sync::atomic::AtomicU64,
+) -> io::Result<Option<Hashed>> {
+    hash_reader_with_layer(Counting(File::open(path)?, read))
+}
+
+struct Counting<'a, R>(R, &'a std::sync::atomic::AtomicU64);
+
+impl<R: Read> Read for Counting<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.0.read(buf)?;
+        self.1
+            .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+        Ok(n)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

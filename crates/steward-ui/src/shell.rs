@@ -6,13 +6,14 @@ use std::path::{Path, PathBuf};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     App, AppContext as _, Context, Entity, InteractiveElement as _, IntoElement, KeyBinding,
-    KeyDownEvent, ParentElement as _, Render, Styled as _, Subscription, Window, actions, div,
-    rems,
+    KeyDownEvent, ParentElement as _, Render, StatefulInteractiveElement as _, Styled as _,
+    Subscription, Window, actions, div, rems,
 };
 use gpui_omarchy::{ActiveTheme as _, ButtonVariant, ChoiceItem, button, tab_list, with_tooltip};
 
 use crate::client::{RootInfo, fetch, print_warning, settings};
 use crate::content::{ContentEvent, ContentView};
+use crate::daemon::DaemonView;
 use crate::settings::{SettingsEvent, SettingsView};
 use crate::tree::{TreeEvent, TreeView};
 
@@ -28,12 +29,14 @@ enum Tab {
     Tree,
     Content,
     Settings,
+    Daemon,
 }
 
-const TABS: [(Tab, &str); 3] = [
+const TABS: [(Tab, &str); 4] = [
     (Tab::Tree, "Tree"),
     (Tab::Content, "Content ids"),
     (Tab::Settings, "Settings"),
+    (Tab::Daemon, "Daemon"),
 ];
 
 pub struct Shell {
@@ -46,6 +49,7 @@ pub struct Shell {
     tree: Entity<TreeView>,
     content: Entity<ContentView>,
     settings: Entity<SettingsView>,
+    daemon: Entity<DaemonView>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -54,6 +58,7 @@ impl Shell {
         let tree = cx.new(|cx| TreeView::new(start.clone(), window, cx));
         let content = cx.new(|cx| ContentView::new(window, cx));
         let settings = cx.new(|cx| SettingsView::new(window, cx));
+        let daemon = cx.new(|cx| DaemonView::new(window, cx));
         let subs = vec![
             cx.subscribe_in(
                 &tree,
@@ -93,6 +98,7 @@ impl Shell {
             tree,
             content,
             settings,
+            daemon,
             _subscriptions: subs,
         };
         this.load_roots(Some(start), cx);
@@ -133,6 +139,7 @@ impl Shell {
             Tab::Tree => self.tree.read(cx).focus.clone(),
             Tab::Content => self.content.read(cx).focus.clone(),
             Tab::Settings => self.settings.read(cx).focus.clone(),
+            Tab::Daemon => self.daemon.read(cx).focus.clone(),
         };
         window.focus(&handle, cx);
     }
@@ -188,8 +195,10 @@ impl Shell {
 
     fn switch(&mut self, tab: Tab, window: &mut Window, cx: &mut Context<'_, Self>) {
         self.tab = tab;
-        if tab == Tab::Content {
-            self.content.update(cx, |c, cx| c.refresh(cx));
+        match tab {
+            Tab::Content => self.content.update(cx, |c, cx| c.refresh(cx)),
+            Tab::Daemon => self.daemon.update(cx, |d, cx| d.refresh(cx)),
+            Tab::Tree | Tab::Settings => {}
         }
         self.focus_active(window, cx);
         cx.notify();
@@ -206,6 +215,7 @@ impl Shell {
                 "1" => Tab::Tree,
                 "2" => Tab::Content,
                 "3" => Tab::Settings,
+                "4" => Tab::Daemon,
                 _ => return,
             };
             self.switch(tab, window, cx);
@@ -352,28 +362,44 @@ impl Render for Shell {
                             .file_name()
                             .map_or(path.clone(), |n| n.to_string_lossy().into_owned());
                         d.child(with_tooltip(
-                            div().id("hashing").child(gpui_omarchy::badge(
-                                format!("hashing {name} {pct:.1}%"),
-                                gpui_omarchy::Status::Neutral,
-                                cx,
-                            )),
-                            format!("computing content ids under {path}"),
+                            div()
+                                .id("hashing")
+                                .cursor_pointer()
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.switch(Tab::Daemon, window, cx);
+                                }))
+                                .child(gpui_omarchy::badge(
+                                    format!("hashing {name} {pct:.1}%"),
+                                    gpui_omarchy::Status::Neutral,
+                                    cx,
+                                )),
+                            format!("computing content ids under {path}\nclick for details"),
                         ))
                     })
                     .when(self.scanning, |d| {
-                        d.child(gpui_omarchy::badge(
-                            "daemon scanning",
-                            gpui_omarchy::Status::Warning,
-                            cx,
+                        d.child(with_tooltip(
+                            div()
+                                .id("scanning")
+                                .cursor_pointer()
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.switch(Tab::Daemon, window, cx);
+                                }))
+                                .child(gpui_omarchy::badge(
+                                    "daemon scanning",
+                                    gpui_omarchy::Status::Warning,
+                                    cx,
+                                )),
+                            "click for details",
                         ))
                     })
-                    .child(div().w(rems(22.0)).child(tabs)),
+                    .child(div().w(rems(28.0)).child(tabs)),
             );
 
         let active = match self.tab {
             Tab::Tree => self.tree.clone().into_any_element(),
             Tab::Content => self.content.clone().into_any_element(),
             Tab::Settings => self.settings.clone().into_any_element(),
+            Tab::Daemon => self.daemon.clone().into_any_element(),
         };
         let content = div()
             .on_key_down(
@@ -396,7 +422,7 @@ impl Render for Shell {
                     .text_size(rems(0.6875))
                     .text_color(theme.secondary)
                     .when(true, |d| {
-                        d.child("ctrl 1/2/3 tabs · ctrl +/−/0 zoom · ctrl-q quit")
+                        d.child("ctrl 1–4 tabs · ctrl +/−/0 zoom · ctrl-q quit")
                     }),
             );
         crate::decorations::frame(content, title.into(), window, &theme)

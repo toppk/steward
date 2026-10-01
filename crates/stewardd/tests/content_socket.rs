@@ -238,6 +238,26 @@ fn content_socket_end_to_end() {
     assert_eq!(activity["subscribers"], 1);
     assert!(activity["event_seq"].as_u64().unwrap() > 0);
     assert!(activity["reading"].is_array());
+    let status = d.admin().unwrap().call("status", json!({})).unwrap();
+    assert_eq!(status["daemon"]["version"], env!("CARGO_PKG_VERSION"));
+    assert!(status["daemon"]["db_bytes"].as_u64().unwrap() > 0);
+    assert!(status["daemon"]["uptime_secs"].is_u64());
+    let scans = status["recent_scans"].as_array().unwrap();
+    assert!(
+        scans
+            .iter()
+            .any(|s| s["kind"] == "full" && s["root"] == json!(d.data))
+    );
+    assert_eq!(status["schedule"][0]["path"], json!(d.data));
+    assert!(status["schedule"][0]["next"].as_f64().unwrap() > 0.0);
+    // verify of a changed file logged a warning, kept for status.
+    let problems = status["problems"].as_array().unwrap();
+    assert!(
+        problems
+            .iter()
+            .any(|p| p["level"] == "warning" && p["message"].as_str().unwrap().contains("holds")),
+        "{problems:?}"
+    );
 
     // A new subscriber can replay everything since the start.
     let replay = d.content().subscribe(Some(0), None).unwrap();

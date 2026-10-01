@@ -141,7 +141,7 @@ async fn run() -> Result<()> {
         next_conn += 1;
         let pid = stream.peer_cred().ok().and_then(|c| c.pid());
         let which = if admin { "api" } else { "content" };
-        let span = tracing::debug_span!("conn", id = next_conn, socket = which);
+        let span = tracing::debug_span!("conn", id = next_conn, socket = %which);
         span.in_scope(|| tracing::trace!("opened by pid {pid:?}"));
         tokio::spawn(serve(Arc::clone(&engine), stream, admin).instrument(span));
     }
@@ -443,6 +443,11 @@ async fn schedule(
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .remove(&path);
+            engine
+                .next_scans
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&path);
             return;
         };
         let known = match engine.index.connect() {
@@ -470,7 +475,17 @@ async fn schedule(
             Err(e) => tracing::error!("scan {}: {e:#}", root.path.display()),
         }
         round = round.wrapping_add(1);
-        tokio::time::sleep(Duration::from_secs(root.interval_minutes * 60)).await;
+        let wait = Duration::from_secs(root.interval_minutes * 60);
+        let next = std::time::SystemTime::now() + wait;
+        let next = next
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0.0, |d| d.as_secs_f64());
+        engine
+            .next_scans
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(root.path.clone(), next);
+        tokio::time::sleep(wait).await;
     }
 }
 

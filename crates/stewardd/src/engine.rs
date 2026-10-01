@@ -91,7 +91,18 @@ pub struct HashProgress {
     pub files_done: u64,
     pub bytes_total: u64,
     pub bytes_done: u64,
+    /// When the job started, in seconds since the Unix epoch.
+    pub started: f64,
 }
+
+fn unix_now() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0.0, |d| d.as_secs_f64())
+}
+
+/// Scans remembered for `status`.
+const RECENT_SCANS: usize = 50;
 
 fn build_hash_pool(threads: usize) -> std::sync::Arc<rayon::ThreadPool> {
     std::sync::Arc::new(
@@ -118,6 +129,12 @@ fn duration(secs: f64) -> String {
 
 pub struct Engine {
     pub events: crate::events::Bus,
+    started: std::time::Instant,
+    started_unix: f64,
+    /// The last scans, newest last, for `status`.
+    recent_scans: std::sync::Mutex<std::collections::VecDeque<Value>>,
+    /// When each root's scheduler will scan it next (Unix seconds).
+    pub next_scans: std::sync::Mutex<HashMap<PathBuf, f64>>,
     pub activity: crate::activity::Activity,
     /// Paths under `verify`: withheld from `resolve` until it answers.
     suspect: std::sync::Mutex<HashSet<PathBuf>>,
@@ -220,6 +237,19 @@ where
     }
 }
 
+/// The last warnings and errors logged, newest first.
+fn problems_report() -> Value {
+    json!(
+        steward_log::recent()
+            .into_iter()
+            .rev()
+            .map(|p| json!({
+                "time": p.time, "level": p.level, "context": p.context, "message": p.message,
+            }))
+            .collect::<Vec<_>>()
+    )
+}
+
 pub fn report(s: &ScanStats) -> ScanReport {
     ScanReport {
         root: s.root.display().to_string(),
@@ -284,6 +314,10 @@ impl Engine {
         tracing::debug!("hashing uses {} threads", config.hash_threads());
         Ok(Self {
             events: crate::events::Bus::default(),
+            started: std::time::Instant::now(),
+            started_unix: unix_now(),
+            recent_scans: std::sync::Mutex::default(),
+            next_scans: std::sync::Mutex::default(),
             activity: crate::activity::Activity::default(),
             suspect: std::sync::Mutex::default(),
             hashing: std::sync::Mutex::new(None),
@@ -417,6 +451,10 @@ impl Engine {
                     "scanning": self.scan_lock.try_lock().is_err(),
                     "hashing": self.hash_progress(),
                     "activity": self.activity_report(),
+                    "daemon": self.daemon_report(),
+                    "recent_scans": self.recent_scans_report(),
+                    "schedule": self.schedule_report(),
+                    "problems": problems_report(),
                 })
             }
             Request::Scan {
@@ -518,6 +556,66 @@ impl Engine {
                 bail!("subscriptions belong to a connection; send them to the daemon")
             }
         })
+    }
+
+    /// The daemon itself: version, process, uptime, index size, sockets.
+    fn daemon_report(&self) -> Value {
+        let config = self.config();
+        let size = |p: &Path| std::fs::metadata(p).map_or(0, |m| m.len());
+        let mut wal = config.db.clone().into_os_string();
+        wal.push("-wal");
+        json!({
+            "version": env!("CARGO_PKG_VERSION"),
+            "pid": std::process::id(),
+            "started": self.started_unix,
+            "uptime_secs": self.started.elapsed().as_secs(),
+            "epoch": self.events.epoch,
+            "hash_threads": config.hash_threads(),
+            "db": config.db,
+            "db_bytes": size(&config.db) + size(Path::new(&wal)),
+            "api_socket": steward_proto::socket_path(),
+            "content_socket": steward_proto::content_socket_path(),
+            "managed": self.managed,
+        })
+    }
+
+    /// Newest first.
+    fn recent_scans_report(&self) -> Value {
+        let scans = self
+            .recent_scans
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        json!(scans.iter().rev().collect::<Vec<_>>())
+    }
+
+    fn schedule_report(&self) -> Value {
+        let next = self
+            .next_scans
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut out: Vec<_> = next
+            .iter()
+            .map(|(p, t)| json!({ "path": p, "next": t }))
+            .collect();
+        out.sort_by(|a, b| a["path"].as_str().cmp(&b["path"].as_str()));
+        json!(out)
+    }
+
+    fn record_scan(&self, path: &Path, kind: &str, result: &Result<ScanReport>) {
+        let mut entry = match result {
+            Ok(r) => serde_json::to_value(r).unwrap_or_default(),
+            Err(e) => json!({ "root": path, "error": format!("{e:#}") }),
+        };
+        entry["kind"] = json!(kind);
+        entry["finished"] = json!(unix_now());
+        let mut scans = self
+            .recent_scans
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if scans.len() == RECENT_SCANS {
+            scans.pop_front();
+        }
+        scans.push_back(entry);
     }
 
     /// What is running now, beyond the job summaries in `status`.
@@ -982,7 +1080,7 @@ impl Engine {
                     .par_iter()
                     .map(|(p, m)| {
                         let reading = readers.start(p, m.size);
-                        let hashed = steward_contentid::hash_file(p);
+                        let hashed = steward_contentid::hash_file_counting(p, reading.counter());
                         drop(reading);
                         match hashed {
                             Ok(_) if Meta::lstat(p).ok().as_ref() != Some(m) => Hashing::Changing,
@@ -1177,9 +1275,12 @@ impl Engine {
     ) -> Result<ScanReport> {
         let kind = if trust_dir_mtime { "trusting" } else { "full" };
         let span = tracing::info_span!("scan", path = %path.display(), kind = %kind);
-        self.scan_now(path, trust_dir_mtime, read_root)
+        let result = self
+            .scan_now(path, trust_dir_mtime, read_root)
             .instrument(span)
-            .await
+            .await;
+        self.record_scan(path, kind, &result);
+        result
     }
 
     async fn scan_now(
@@ -1427,12 +1528,14 @@ impl Engine {
         let bytes_total: u64 = stale.iter().map(|(_, m, _)| m.size).sum();
         tracing::debug!("hashing {files_total} files ({})", gib(bytes_total));
         let started = std::time::Instant::now();
+        let started_unix = unix_now();
         self.set_hash_progress(Some(HashProgress {
             path: path.to_path_buf(),
             files_total,
             bytes_total,
             files_done: 0,
             bytes_done: 0,
+            started: started_unix,
         }));
 
         // Results stream back as each file finishes, so a restart loses at
@@ -1456,7 +1559,7 @@ impl Engine {
                         let _span = span.enter();
                         let t = std::time::Instant::now();
                         let reading = readers.start(&p, m.size);
-                        let result = steward_contentid::hash_file(&p);
+                        let result = steward_contentid::hash_file_counting(&p, reading.counter());
                         drop(reading);
                         let changed = Meta::lstat(&p).ok() != Some(m);
                         let secs = t.elapsed().as_secs_f64();
@@ -1518,6 +1621,7 @@ impl Engine {
                 bytes_total,
                 files_done,
                 bytes_done,
+                started: started_unix,
             }));
             if last_log.elapsed().as_secs() >= 60 || done {
                 last_log = std::time::Instant::now();
@@ -1588,11 +1692,16 @@ impl Engine {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = p;
     }
 
+    /// The hashing job, counting what has been read of files in flight:
+    /// one film can take minutes, and progress shouldn't stall meanwhile.
     pub fn hash_progress(&self) -> Option<HashProgress> {
-        self.hashing
+        let mut p = self
+            .hashing
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
+            .clone()?;
+        p.bytes_done = (p.bytes_done + self.activity.read_under(&p.path)).min(p.bytes_total);
+        Some(p)
     }
 
     /// Content stored at more than one path, as far as those paths lie under

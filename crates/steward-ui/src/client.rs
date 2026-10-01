@@ -81,3 +81,63 @@ pub fn settings(c: &mut Client) -> Result<Settings, Error> {
         }),
     })
 }
+
+/// Everything the Daemon tab shows, taken at one moment.
+pub struct Snapshot {
+    pub taken: f64,
+    pub status: serde_json::Value,
+    /// Per-root settings and state (offline); None if the call failed.
+    pub settings: Option<serde_json::Value>,
+    /// The daemon's latest events, newest first.
+    pub events: Vec<serde_json::Value>,
+}
+
+/// Events replayed into the Daemon tab.
+const RECENT_EVENTS: u64 = 100;
+
+pub fn snapshot(c: &mut Client) -> Result<Snapshot, Error> {
+    let status = c.request(&Request::Status)?;
+    let settings = c.request(&Request::Settings).ok();
+    let seq = status["activity"]["event_seq"].as_u64().unwrap_or(0);
+    Ok(Snapshot {
+        taken: crate::format::now(),
+        status,
+        settings,
+        events: recent_events(seq),
+    })
+}
+
+/// The events up to `seq`, replayed from the daemon's backlog on a
+/// connection of their own, newest first. Best effort: what arrived before
+/// any failure.
+fn recent_events(seq: u64) -> Vec<serde_json::Value> {
+    let mut out = Vec::new();
+    if seq == 0 {
+        return out;
+    }
+    let Ok(c) = Client::connect() else {
+        return out;
+    };
+    if c.set_timeout(Some(std::time::Duration::from_secs(5)))
+        .is_err()
+    {
+        return out;
+    }
+    let Ok(events) = c.subscribe(Some(seq.saturating_sub(RECENT_EVENTS)), None) else {
+        return out;
+    };
+    for msg in events {
+        let Ok(msg) = msg else { break };
+        if msg["method"] != "event" {
+            break;
+        }
+        let params = msg["params"].clone();
+        let at = params["seq"].as_u64().unwrap_or(u64::MAX);
+        out.push(params);
+        if at >= seq {
+            break;
+        }
+    }
+    out.reverse();
+    out
+}

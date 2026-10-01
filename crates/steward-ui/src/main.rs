@@ -3,6 +3,7 @@
 
 mod client;
 mod content;
+mod daemon;
 mod decorations;
 mod format;
 mod settings;

@@ -10,7 +10,8 @@ use std::time::Instant;
 
 use serde_json::{Value, json};
 
-type Reads = Arc<Mutex<HashMap<PathBuf, (u64, Instant)>>>;
+/// Each file being read: its size, when reading began, and bytes read.
+type Reads = Arc<Mutex<HashMap<PathBuf, (u64, Instant, Arc<AtomicU64>)>>>;
 
 #[derive(Default)]
 pub struct Activity {
@@ -33,7 +34,14 @@ impl Drop for Scanning<'_> {
 #[derive(Clone)]
 pub struct Readers(Reads);
 
-pub struct Reading(Reads, PathBuf);
+pub struct Reading(Reads, PathBuf, Arc<AtomicU64>);
+
+impl Reading {
+    /// Where the reader adds the bytes it has read.
+    pub fn counter(&self) -> &AtomicU64 {
+        &self.2
+    }
+}
 
 impl Drop for Reading {
     fn drop(&mut self) {
@@ -46,11 +54,15 @@ impl Drop for Reading {
 
 impl Readers {
     pub fn start(&self, path: &Path, size: u64) -> Reading {
+        let read = Arc::new(AtomicU64::new(0));
         self.0
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .insert(path.to_path_buf(), (size, Instant::now()));
-        Reading(Arc::clone(&self.0), path.to_path_buf())
+            .insert(
+                path.to_path_buf(),
+                (size, Instant::now(), Arc::clone(&read)),
+            );
+        Reading(Arc::clone(&self.0), path.to_path_buf(), read)
     }
 }
 
@@ -81,6 +93,17 @@ impl Activity {
         Readers(Arc::clone(&self.reads))
     }
 
+    /// Bytes read so far of the files in flight under `dir`.
+    pub fn read_under(&self, dir: &Path) -> u64 {
+        self.reads
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .filter(|(p, _)| p.starts_with(dir))
+            .map(|(_, (_, _, read))| read.load(Ordering::Relaxed))
+            .sum()
+    }
+
     pub fn report(&self) -> Value {
         let scan = self
             .scan
@@ -95,14 +118,23 @@ impl Activity {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .iter()
-            .map(|(p, (size, t))| (t.elapsed().as_secs(), p.clone(), *size))
+            .map(|(p, (size, t, read))| {
+                (
+                    t.elapsed().as_secs(),
+                    p.clone(),
+                    *size,
+                    read.load(Ordering::Relaxed),
+                )
+            })
             .collect();
         reads.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
         json!({
             "scan": scan,
             "reading": reads
                 .into_iter()
-                .map(|(secs, path, size)| json!({ "path": path, "size": size, "secs": secs }))
+                .map(|(secs, path, size, read)| {
+                    json!({ "path": path, "size": size, "read": read, "secs": secs })
+                })
                 .collect::<Vec<_>>(),
             "connections": self.connections.load(Ordering::Relaxed),
             "subscribers": self.subscribers.load(Ordering::Relaxed),

@@ -74,6 +74,38 @@ pub fn mode(kind_char: char, mode: u32) -> String {
     s
 }
 
+/// Local wall-clock time of a Unix timestamp: `14:03:27`, with the date
+/// when it isn't today.
+pub fn clock(unix: f64) -> String {
+    use chrono::TimeZone as _;
+    let Some(t) = chrono::Local.timestamp_opt(unix as i64, 0).single() else {
+        return "?".into();
+    };
+    if t.date_naive() == chrono::Local::now().date_naive() {
+        t.format("%H:%M:%S").to_string()
+    } else {
+        t.format("%Y-%m-%d %H:%M").to_string()
+    }
+}
+
+/// A span of time, coarse: `45s`, `12m 03s`, `3h 07m`, `2d 04h`.
+pub fn duration(secs: f64) -> String {
+    let s = secs.max(0.0) as u64;
+    match s {
+        0..60 => format!("{s}s"),
+        60..3600 => format!("{}m {:02}s", s / 60, s % 60),
+        3600..86_400 => format!("{}h {:02}m", s / 3600, s % 3600 / 60),
+        _ => format!("{}d {:02}h", s / 86_400, s % 86_400 / 3600),
+    }
+}
+
+/// Seconds since the Unix epoch, now.
+pub fn now() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0.0, |d| d.as_secs_f64())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

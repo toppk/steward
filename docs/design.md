@@ -293,10 +293,23 @@ concurrently; match responses by `id`. Errors are
 with `steward raw METHOD '{…}'` or
 `socat - UNIX-CONNECT:$XDG_RUNTIME_DIR/steward/content.socket`.
 
-`status` includes `activity`: the scan in progress (path, mode, seconds),
-every file being read for hashing (path, size, seconds), the hash queue, the
-open connections and subscribers, and the last event's `seq`. `kill -USR2`
-writes the same report to the daemon's log.
+`status` reports the daemon's internal state:
+
+- `activity`: the scan in progress (path, mode, seconds), every file being
+  read for hashing (path, size, bytes read so far, seconds), the hash queue,
+  open connections and subscribers, and the last event's `seq`;
+- `hashing`: the job, whose `bytes_done` includes what has been read of
+  files still in flight, so progress moves during a 50 GB film;
+- `daemon`: version, pid, start time and uptime, index size on disk, hashing
+  threads, socket paths;
+- `recent_scans`: the last 50 scans, with timings, changes and errors;
+- `schedule`: when each root is scanned next;
+- `problems`: the last 200 warnings and errors logged, with their spans.
+
+`kill -USR2` writes `activity` to the daemon's log. The GUI's Daemon tab
+(ctrl-4) shows all of it, plus the latest events replayed from the
+backlog, as a snapshot with a Refresh button and optional refresh every
+two seconds; the header's scanning and hashing badges open it.
 
 `python/steward_client.py` is a standard-library client: blocking and
 asyncio, typed results for the content primitives, and an event stream that
