@@ -272,6 +272,11 @@ pub struct Entry {
     pub total_alloc: u64,
     pub total_files: u64,
     pub total_dirs: u64,
+    /// Entries beneath, itself included: files, directories, symlinks and
+    /// the rest. Roughly the inodes the subtree uses (hard links count once
+    /// per link). 1 for non-directories.
+    #[serde(default)]
+    pub total_items: u64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

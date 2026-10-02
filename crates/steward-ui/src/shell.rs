@@ -297,11 +297,15 @@ impl Render for Shell {
                     path.display()
                 ),
                 Some(e) => format!(
-                    "{}: {} dirs, {} files, {} on disk",
+                    "{}: {} dirs, {} files, {} items, {} on disk{}",
                     path.display(),
                     crate::format::count(e.total_dirs.saturating_sub(1)),
                     crate::format::count(e.total_files),
-                    crate::format::bytes(e.total_alloc)
+                    crate::format::count(e.total_items),
+                    crate::format::bytes(e.total_alloc),
+                    crate::format::filesystem(&r.fs)
+                        .map(|(f, _)| format!("\nfilesystem: {f}"))
+                        .unwrap_or_default()
                 ),
                 None => format!("{}: not scanned yet", path.display()),
             };

@@ -356,3 +356,61 @@ fn filesystem_ids_are_not_st_dev() {
     let m = Meta::lstat(&here).unwrap();
     assert_eq!(m.dev, rustix::fs::statvfs(&here).unwrap().f_fsid);
 }
+
+async fn items(index: &Index, path: &Path) -> u64 {
+    let conn = index.connect().unwrap();
+    let id = index.resolve(&conn, path).await.unwrap().expect("indexed");
+    index.get(&conn, id).await.unwrap().unwrap().t_items
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn items_count_every_entry_through_rescans_and_repairs() {
+    let (tmp, index, root) = fixture().await;
+    std::os::unix::fs::symlink("top.txt", root.join("link")).unwrap();
+    index.scan(&root, opts()).await.unwrap();
+    // root, a, a/b, a/one.txt, a/b/two.txt, top.txt, link
+    assert_eq!(items(&index, &root).await, 7);
+    assert_eq!(items(&index, &root.join("a")).await, 4);
+
+    // Incremental: a new directory with a file and a symlink in it.
+    fs::create_dir(root.join("a/c")).unwrap();
+    fs::write(root.join("a/c/three.txt"), b"3").unwrap();
+    std::os::unix::fs::symlink("three.txt", root.join("a/c/also")).unwrap();
+    index.scan(&root, opts()).await.unwrap();
+    assert_eq!(items(&index, &root).await, 10);
+    assert_eq!(items(&index, &root.join("a/c")).await, 3);
+    fs::remove_file(root.join("link")).unwrap();
+    index.scan(&root, opts()).await.unwrap();
+    assert_eq!(items(&index, &root).await, 9);
+
+    // A full recompute agrees with the incremental totals.
+    let conn = index.connect().unwrap();
+    conn.execute("UPDATE entries SET t_items = 0", ())
+        .await
+        .unwrap();
+    conn.execute("UPDATE meta SET value = 2 WHERE key = 'totals'", ())
+        .await
+        .unwrap();
+    drop(conn);
+    drop(index);
+    let index = Index::open(&tmp.path().join("db/index.db")).await.unwrap();
+    assert_eq!(items(&index, &root).await, 9);
+    assert_eq!(items(&index, &root.join("a/c")).await, 3);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_index_without_item_counts_gains_them_on_open() {
+    let (tmp, index, root) = fixture().await;
+    index.scan(&root, opts()).await.unwrap();
+    let conn = index.connect().unwrap();
+    conn.execute("ALTER TABLE entries DROP COLUMN t_items", ())
+        .await
+        .unwrap();
+    conn.execute("UPDATE meta SET value = 2 WHERE key = 'totals'", ())
+        .await
+        .unwrap();
+    drop(conn);
+    drop(index);
+    let index = Index::open(&tmp.path().join("db/index.db")).await.unwrap();
+    assert_eq!(items(&index, &root).await, 6);
+}

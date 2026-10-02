@@ -37,6 +37,8 @@ pub struct RootInfo {
     pub indexed: Option<Entry>,
     /// Its volume was not mounted at the last scan; the index is unchanged.
     pub offline: bool,
+    /// Capacity of the filesystem it is on, as `settings` reports it.
+    pub fs: serde_json::Value,
 }
 
 pub struct Settings {
@@ -58,6 +60,7 @@ pub fn settings(c: &mut Client) -> Result<Settings, Error> {
                 settings: serde_json::from_value(r["settings"].clone())?,
                 indexed: serde_json::from_value(r["indexed"].clone())?,
                 offline: r["offline"].as_bool().unwrap_or(false),
+                fs: r["fs"].clone(),
             })
         })
         .collect::<Result<_, serde_json::Error>>()?;

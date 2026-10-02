@@ -33,11 +33,11 @@ Paths may be relative; `steward` makes them absolute before sending them.
 :   The settings file, each root's policy, its index totals and whether it
     is offline.
 
-`steward ls PATH`
+`steward ls PATH [--by space|items]`
 :   The children of a directory, largest on disk first, with size, share,
     file count and tags.
 
-`steward tree PATH [-d DEPTH] [-t TOP]`
+`steward tree PATH [-d DEPTH] [-t TOP] [--by space|items]`
 :   A qdirstat-style tree, largest first: `DEPTH` levels (default 2),
     the `TOP` largest children at each level (default 10).
 
@@ -53,6 +53,20 @@ Paths may be relative; `steward` makes them absolute before sending them.
 
     The columns are space on disk, share of the parent, a bar, and the
     number of files beneath.
+
+    `--by items` ranks by **items** instead: every entry beneath (files,
+    directories, symlinks and the rest), which is what uses up inodes (or
+    btrfs metadata). The first column is then the item count and the last
+    the space on disk:
+
+    ```
+    $ steward tree /usr/share -d 1 -t 3 --by items
+      390.3k 100.0% ##########    13.6G share/
+       58.4k  15.0% #            172.9M   icons/
+       43.3k  11.1% #            655.4M   doc/
+       37.9k   9.7% #            183.5M   help/
+      250.7k                      … 470 more
+    ```
 
 `steward stat PATH`
 :   One entry as JSON: type, mode, owner, size, space on disk, modification

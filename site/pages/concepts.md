@@ -24,10 +24,15 @@ For every path under a root, the index keeps what `lstat` reports:
 | modification time (and change time, for directories) | anything inside archives |
 
 Each directory also carries **subtree totals**: total size, total space on
-disk, number of files and number of directories beneath it. They are kept
+disk, and the number of files, directories and **items** beneath it. Items
+counts every entry: files, directories, symlinks, sockets and the rest. It
+is what uses up a filesystem's inodes (or, on btrfs, its metadata space),
+so ranking by items finds where millions of small files pile up. They are kept
 current as the tree changes, so "how big is this folder" is a lookup, not a
-walk. A file with several hard links contributes its share to each
-directory that holds a link, so totals don't count the same bytes twice.
+walk. A file with several hard links contributes its share of the bytes to
+each directory that holds a link, so totals don't count the same bytes
+twice. Items count names, so each link counts once: like `du --inodes -l`,
+not plain `du --inodes`, which counts a shared inode only once.
 
 The index is a single database file in SQLite format, by default
 `~/.local/state/steward/index.db`. Its size grows with the number of paths,

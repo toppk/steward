@@ -42,8 +42,9 @@ struct Row {
     depth: usize,
     expanded: bool,
     loading: bool,
-    /// Subtree total of the parent, for the percentage column.
+    /// The parent's subtree totals, for the percentage column.
     parent_alloc: u64,
+    parent_items: u64,
 }
 
 impl Row {
@@ -60,6 +61,38 @@ impl Row {
             .rsplit('/')
             .next()
             .unwrap_or(&self.entry.path)
+    }
+}
+
+/// What the tree ranks and measures by.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Measure {
+    /// Space on disk.
+    Space,
+    /// Entries beneath: files, directories, symlinks… (roughly inodes).
+    Items,
+}
+
+impl Measure {
+    fn of(self, e: &Entry) -> u64 {
+        match self {
+            Self::Space => e.total_alloc,
+            Self::Items => e.total_items,
+        }
+    }
+
+    fn parent(self, r: &Row) -> u64 {
+        match self {
+            Self::Space => r.parent_alloc,
+            Self::Items => r.parent_items,
+        }
+    }
+
+    fn show(self, e: &Entry) -> String {
+        match self {
+            Self::Space => format::bytes(e.total_alloc),
+            Self::Items => format::count(e.total_items),
+        }
     }
 }
 
@@ -84,6 +117,7 @@ pub struct TreeView {
     message: Option<SharedString>,
     /// The daemon is mid-scan, so directory totals may still be zero.
     scanning: bool,
+    measure: Measure,
     polling: bool,
     _subscriptions: Vec<Subscription>,
 }
@@ -114,6 +148,7 @@ impl TreeView {
             message: None,
             scanning: false,
             polling: false,
+            measure: Measure::Space,
             _subscriptions: vec![sub],
         };
         this.load_root(None, cx);
@@ -143,13 +178,14 @@ impl TreeView {
                         if scanning {
                             this.poll_scan(cx);
                         }
-                        let alloc = entry.total_alloc;
+                        let (alloc, items) = (entry.total_alloc, entry.total_items);
                         this.rows = vec![Row {
                             entry,
                             depth: 0,
                             expanded: false,
                             loading: false,
                             parent_alloc: alloc,
+                            parent_items: items,
                         }];
                         this.message = None;
                         this.expand(0, reveal, cx);
@@ -247,18 +283,59 @@ impl TreeView {
         .detach();
     }
 
-    fn insert_children(&mut self, ix: usize, kids: Vec<Entry>) {
+    fn insert_children(&mut self, ix: usize, mut kids: Vec<Entry>) {
         let depth = self.rows[ix].depth + 1;
         let parent_alloc = self.rows[ix].entry.total_alloc;
+        let parent_items = self.rows[ix].entry.total_items;
         self.rows[ix].expanded = true;
+        let measure = self.measure;
+        kids.sort_by_key(|e| std::cmp::Reverse(measure.of(e)));
         let new = kids.into_iter().map(|entry| Row {
             entry,
             depth,
             expanded: false,
             loading: false,
             parent_alloc,
+            parent_items,
         });
         self.rows.splice(ix + 1..ix + 1, new);
+    }
+
+    /// Rank by `measure` instead, keeping what is expanded and selected.
+    fn set_measure(&mut self, measure: Measure, cx: &mut Context<'_, Self>) {
+        if measure == self.measure || self.rows.is_empty() {
+            self.measure = measure;
+            cx.notify();
+            return;
+        }
+        self.measure = measure;
+        let expanded: std::collections::HashSet<String> = self
+            .rows
+            .iter()
+            .filter(|r| r.expanded)
+            .map(|r| r.entry.path.clone())
+            .collect();
+        let selected = self.rows.get(self.selected).map(|r| r.entry.path.clone());
+        let mut root = self.rows[0].clone();
+        root.expanded = false;
+        self.rows = vec![root];
+        // Re-expand in order, from the cache: children are already known.
+        let mut ix = 0;
+        while ix < self.rows.len() {
+            let path = self.rows[ix].entry.path.clone();
+            if expanded.contains(&path)
+                && let Some(kids) = self.children.get(&path).cloned()
+            {
+                self.insert_children(ix, kids);
+            }
+            ix += 1;
+        }
+        self.selected = selected
+            .and_then(|p| self.rows.iter().position(|r| r.entry.path == p))
+            .unwrap_or(0);
+        self.scroll
+            .scroll_to_item(self.selected, ScrollStrategy::Center);
+        cx.notify();
     }
 
     fn collapse(&mut self, ix: usize) {
@@ -483,6 +560,13 @@ impl TreeView {
                 }
             }
             "r" | "f5" => self.rescan_selected(cx),
+            "i" => {
+                let next = match self.measure {
+                    Measure::Space => Measure::Items,
+                    Measure::Items => Measure::Space,
+                };
+                self.set_measure(next, cx);
+            }
             _ => return,
         }
         cx.notify();
@@ -527,14 +611,16 @@ fn tree_row(
     row: &Row,
     ix: usize,
     selected: bool,
+    measure: Measure,
     theme: &Theme,
     cx: &mut Context<'_, TreeView>,
 ) -> impl IntoElement {
     let e = &row.entry;
-    let pct = if row.parent_alloc == 0 {
+    let whole = measure.parent(row);
+    let pct = if whole == 0 {
         0.0
     } else {
-        e.total_alloc as f32 / row.parent_alloc as f32
+        measure.of(e) as f32 / whole as f32
     };
     let disclosure = match (row.is_dir(), row.expanded, row.loading) {
         (_, _, true) => "…",
@@ -627,7 +713,7 @@ fn tree_row(
                 .text_color(theme.secondary)
                 .child(format!("{:.1}%", pct * 100.0)),
         )
-        .child(right(COL_SIZE).child(format::bytes(e.total_alloc)))
+        .child(right(COL_SIZE).child(measure.show(e)))
         .child(
             right(COL_COUNT)
                 .text_color(theme.secondary)
@@ -649,7 +735,7 @@ fn tree_row(
         .child(cell(COL_TAGS).text_color(tag_col).child(tags))
 }
 
-fn header(theme: &Theme) -> Div {
+fn header(measure: Measure, theme: &Theme) -> Div {
     div()
         .h(ROW_H)
         .flex()
@@ -661,7 +747,10 @@ fn header(theme: &Theme) -> Div {
         .child(div().flex_1().pl(rems(1.5)).child("Name"))
         .child(cell(COL_BAR).child("Subtree"))
         .child(right(COL_PCT).child("%"))
-        .child(right(COL_SIZE).child("Size"))
+        .child(right(COL_SIZE).child(match measure {
+            Measure::Space => "Size",
+            Measure::Items => "Items",
+        }))
         .child(right(COL_COUNT).child("Dirs/Files"))
         .child(right(COL_DATE).child("Modified"))
         .child(cell(COL_TAGS).child("Class"))
@@ -698,9 +787,10 @@ fn status_line(row: Option<&Row>, theme: &Theme, cx: &mut Context<'_, TreeView>)
     .child(format!("{} apparent", format::bytes(e.total_size)))
     .when(r.is_dir(), |d| {
         d.child(format!(
-            "{} dirs, {} files",
+            "{} dirs, {} files, {} items",
             format::count(e.total_dirs.saturating_sub(1)),
-            format::count(e.total_files)
+            format::count(e.total_files),
+            format::count(e.total_items)
         ))
     })
     .when_some(e.content_id.clone(), |d, id| {
@@ -730,7 +820,8 @@ impl Render for TreeView {
                     range
                         .map(|ix| {
                             let row = this.rows[ix].clone();
-                            tree_row(&row, ix, ix == this.selected, &theme, cx).into_any_element()
+                            tree_row(&row, ix, ix == this.selected, this.measure, &theme, cx)
+                                .into_any_element()
                         })
                         .collect::<Vec<_>>()
                 }),
@@ -802,6 +893,41 @@ impl Render for TreeView {
             )
             .child(
                 div()
+                    .pl(rems(0.5))
+                    .text_color(theme.secondary)
+                    .child("Rank by"),
+            )
+            .child(with_tooltip(
+                button(
+                    "by-space",
+                    "Space",
+                    if self.measure == Measure::Space {
+                        ButtonVariant::Primary
+                    } else {
+                        ButtonVariant::Secondary
+                    },
+                    cx,
+                )
+                .on_click(cx.listener(|this, _, _, cx| this.set_measure(Measure::Space, cx))),
+                "rank by space on disk (i toggles)",
+            ))
+            .child(with_tooltip(
+                button(
+                    "by-items",
+                    "Items",
+                    if self.measure == Measure::Items {
+                        ButtonVariant::Primary
+                    } else {
+                        ButtonVariant::Secondary
+                    },
+                    cx,
+                )
+                .on_click(cx.listener(|this, _, _, cx| this.set_measure(Measure::Items, cx))),
+                "rank by entries beneath — files, directories, symlinks — \
+                 roughly the inodes and filesystem metadata they use (i toggles)",
+            ))
+            .child(
+                div()
                     .flex_1()
                     .child(input("locate", &self.locate, window, cx)),
             )
@@ -834,7 +960,9 @@ impl Render for TreeView {
             .font_family(theme.font.clone())
             .text_size(rems(0.8125))
             .child(toolbar)
-            .when(self.mode == Mode::Tree, |d| d.child(header(&theme)))
+            .when(self.mode == Mode::Tree, |d| {
+                d.child(header(self.measure, &theme))
+            })
             .child(list)
             .when(self.scanning, |d| {
                 d.child(

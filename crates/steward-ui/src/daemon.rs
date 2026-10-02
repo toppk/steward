@@ -377,7 +377,8 @@ impl DaemonView {
                 .child(div().w(rems(7.0)).child("state"))
                 .child(div().w(rems(16.0)).child("indexed"))
                 .child(div().w(rems(9.0)).child("rescans"))
-                .child(div().child("next scan")),
+                .child(div().w(rems(16.0)).child("next scan"))
+                .child(div().child("filesystem")),
         );
         for (i, r) in roots.iter().enumerate() {
             let st = &r["settings"];
@@ -394,8 +395,9 @@ impl DaemonView {
                 String::new()
             } else {
                 format!(
-                    "{} files · {}",
+                    "{} files · {} items · {}",
                     format::count(n(indexed, "total_files")),
+                    format::count(n(indexed, "total_items")),
                     format::bytes(n(indexed, "total_alloc"))
                 )
             };
@@ -423,7 +425,12 @@ impl DaemonView {
                             .w(rems(9.0))
                             .child(format!("every {}", format::duration(every as f64 * 60.0))),
                     )
-                    .child(dim(next, theme)),
+                    .child(dim(next, theme).w(rems(16.0)))
+                    .child(match format::filesystem(&r["fs"]) {
+                        Some((text, true)) => div().text_color(theme.warning).child(text),
+                        Some((text, false)) => div().child(text),
+                        None => dim("unknown", theme),
+                    }),
             );
         }
         c

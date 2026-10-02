@@ -237,6 +237,71 @@ where
     }
 }
 
+/// Capacity of the filesystem holding `path`: bytes and inodes, total and
+/// free. `inodes_total` is null where the filesystem allocates inodes on
+/// demand (btrfs); there, metadata space is what small files exhaust, and
+/// `metadata_total` / `metadata_used` report it.
+fn filesystem(path: &Path) -> Value {
+    let Ok(v) = rustix::fs::statvfs(path) else {
+        return Value::Null;
+    };
+    let block = v.f_frsize.max(1);
+    let dynamic = v.f_files == 0;
+    let mount = mount_of(path);
+    let metadata = mount
+        .as_ref()
+        .filter(|m| m.1 == "btrfs")
+        .and_then(|m| btrfs_metadata(&m.2));
+    json!({
+        "type": mount.as_ref().map(|m| m.1.clone()),
+        "mount": mount.as_ref().map(|m| m.0.clone()),
+        "bytes_total": v.f_blocks * block,
+        "bytes_free": v.f_bavail * block,
+        "inodes_total": (!dynamic).then_some(v.f_files),
+        "inodes_free": (!dynamic).then_some(v.f_favail),
+        "metadata_total": metadata.map(|m| m.0),
+        "metadata_used": metadata.map(|m| m.1),
+    })
+}
+
+/// The mount `path` is on: (mount point, filesystem type, source), from
+/// the deepest matching line of /proc/self/mountinfo.
+fn mount_of(path: &Path) -> Option<(PathBuf, String, String)> {
+    let info = std::fs::read_to_string("/proc/self/mountinfo").ok()?;
+    let unescape = |s: &str| s.replace("\\040", " ").replace("\\011", "\t");
+    info.lines()
+        .filter_map(|line| {
+            let (left, right) = line.split_once(" - ")?;
+            let point = PathBuf::from(unescape(left.split(' ').nth(4)?));
+            let mut r = right.split(' ');
+            let fstype = r.next()?.to_string();
+            let source = unescape(r.next()?);
+            path.starts_with(&point).then_some((point, fstype, source))
+        })
+        .max_by_key(|m| m.0.components().count())
+}
+
+/// btrfs metadata space (allocated, used) for the filesystem on `source`,
+/// from /sys/fs/btrfs/<uuid>/allocation, which any user can read.
+fn btrfs_metadata(source: &str) -> Option<(u64, u64)> {
+    let dev = std::fs::canonicalize(source).ok()?;
+    let name = dev.file_name()?.to_owned();
+    for fs in std::fs::read_dir("/sys/fs/btrfs").ok()?.flatten() {
+        if !fs.path().join("devices").join(&name).exists() {
+            continue;
+        }
+        let read = |f: &str| -> Option<u64> {
+            std::fs::read_to_string(fs.path().join("allocation/metadata").join(f))
+                .ok()?
+                .trim()
+                .parse()
+                .ok()
+        };
+        return Some((read("total_bytes")?, read("bytes_used")?));
+    }
+    None
+}
+
 /// The last warnings and errors logged, newest first.
 fn problems_report() -> Value {
     json!(
@@ -299,6 +364,7 @@ pub fn entry(r: &Record, path: &Path, tags: Vec<String>) -> Entry {
             r.t_files
         },
         total_dirs: if leaf { 0 } else { r.t_dirs },
+        total_items: if leaf { 1 } else { r.t_items },
         tags,
         category: leaf
             .then(|| steward_classify::category(&r.name))
@@ -1171,7 +1237,14 @@ impl Engine {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .iter()
                 .any(|p| p == &r.path);
-            roots.push(json!({ "settings": r, "indexed": indexed, "offline": offline }));
+            let fs = if offline {
+                Value::Null
+            } else {
+                filesystem(&r.path)
+            };
+            roots.push(json!({
+                "settings": r, "indexed": indexed, "offline": offline, "fs": fs,
+            }));
         }
         Ok(json!({
             "file": Config::path(),

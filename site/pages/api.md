@@ -92,6 +92,7 @@ One indexed path.
 | `mtime` | integer | modification time, seconds |
 | `total_size`, `total_alloc` | integer | subtree totals for directories; the entry's own figures otherwise |
 | `total_files`, `total_dirs` | integer | files and directories beneath (a directory counts itself) |
+| `total_items` | integer | every entry beneath, the directory included: files, directories, symlinks, the rest; 1 for non-directories |
 | `tags` | string[] | e.g. `classify:repo`; omitted when empty |
 | `category` | string | files only: `image`, `video`, `audio`, `document`, `source`, `archive`, `object`, `disk-image`, `torrent`; omitted when none |
 | `content_id` | string | when a current content id is stored; omitted otherwise |
@@ -341,9 +342,17 @@ qdirstat 2.0 cache file at `out`. Refuses to overwrite an existing file.
 ### settings
 
 No parameters → `{file, db, roots, scanning, hashing, hash_threads,
-hash_threads_default}`. Each of `roots` is `{settings, indexed, offline}`:
-the root's policy, an Entry for it (or null before its first scan), and
-whether its volume is offline.
+hash_threads_default}`. Each of `roots` is `{settings, indexed, offline,
+fs}`: the root's policy, an Entry for it (or null before its first scan),
+whether its volume is offline, and the capacity of the filesystem it is on
+(null when offline):
+
+| `fs` field | |
+|---|---|
+| `type`, `mount` | filesystem type and mount point |
+| `bytes_total`, `bytes_free` | space, as `df` reports it |
+| `inodes_total`, `inodes_free` | inodes, as `df -i` reports them; null where inodes are allocated on demand (btrfs) |
+| `metadata_total`, `metadata_used` | btrfs only: metadata space allocated, and used. Many small files exhaust this while `df` still shows free space |
 
 ### put_root
 

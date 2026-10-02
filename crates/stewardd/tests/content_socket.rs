@@ -112,7 +112,13 @@ fn content_socket_end_to_end() {
     let mut c = d.content();
     let e = c.call("reload", json!({})).unwrap_err();
     assert_eq!(e.kind, "forbidden");
-    assert!(d.admin().unwrap().call("settings", json!({})).is_ok());
+    let settings = d.admin().unwrap().call("settings", json!({})).unwrap();
+    let fs = &settings["roots"][0]["fs"];
+    assert!(fs["bytes_total"].as_u64().unwrap() > 0, "{fs}");
+    assert!(fs["type"].is_string() && fs["mount"].is_string(), "{fs}");
+    // data/, films/, a.bin, b.bin
+    let stat = c.call("stat", json!({ "path": d.data })).unwrap();
+    assert_eq!(stat["total_items"], 4);
     let e = c.call("no_such_method", json!({})).unwrap_err();
     assert_eq!(e.kind, "method_not_found");
 

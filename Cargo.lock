@@ -7050,6 +7050,7 @@ dependencies = [
  "flate2",
  "ignore",
  "rayon",
+ "rustix 1.1.5",
  "serde",
  "serde_json",
  "steward-classify",

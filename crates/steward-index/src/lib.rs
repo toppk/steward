@@ -38,7 +38,9 @@ CREATE TABLE IF NOT EXISTS entries (
     t_size INTEGER NOT NULL DEFAULT 0,
     t_alloc INTEGER NOT NULL DEFAULT 0,
     t_files INTEGER NOT NULL DEFAULT 0,
-    t_dirs INTEGER NOT NULL DEFAULT 0
+    t_dirs INTEGER NOT NULL DEFAULT 0,
+    -- Every entry beneath, the directory included: what uses inodes.
+    t_items INTEGER NOT NULL DEFAULT 0
 );
 -- Kept live even while loading an empty index: dropping and rebuilding them
 -- was 12 s faster on a 15.7M-entry first scan but peaked 1.1 GB higher,
@@ -86,7 +88,7 @@ CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value INTEGER NOT NULL);
 
 /// Bumped whenever the meaning of the `t_*` columns changes; an index built
 /// under another version gets every total recomputed on open.
-const TOTALS_VERSION: i64 = 2;
+const TOTALS_VERSION: i64 = 3;
 
 /// Bumped when stored columns change meaning; `open` migrates older indexes.
 /// 1: files store ctime 0 (only directories keep it).
@@ -97,7 +99,7 @@ const LAYOUT_VERSION: i64 = 1;
 const FULL_AGGREGATE_OVER: usize = 50_000;
 
 const ENTRY_COLS: &str = "id, parent, name, kind, mode, uid, gid, size, \
-    alloc, nlink, dev, ino, mtime_ns, ctime_ns, t_size, t_alloc, t_files, t_dirs";
+    alloc, nlink, dev, ino, mtime_ns, ctime_ns, t_size, t_alloc, t_files, t_dirs, t_items";
 
 /// Writes per transaction during a scan, so readers see progress and a
 /// crash loses little. Measured on disk: per-directory commits are 10x
@@ -115,6 +117,9 @@ pub struct Record {
     pub t_alloc: u64,
     pub t_files: u64,
     pub t_dirs: u64,
+    /// Entries beneath a directory, itself included (files, directories,
+    /// symlinks, everything): roughly the inodes it uses.
+    pub t_items: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -372,6 +377,7 @@ fn record(row: &Row) -> Result<Record> {
         t_alloc: u(15)?,
         t_files: u(16)?,
         t_dirs: u(17)?,
+        t_items: u(18)?,
     })
 }
 
@@ -382,18 +388,20 @@ fn name_bytes(name: &OsStr) -> Vec<u8> {
 /// Totals a non-directory contributes to its ancestors. A hardlinked file
 /// contributes `1/nlink` per link, so totals stay right without a global
 /// de-duplication pass whenever all links sit inside the subtree.
-fn leaf_totals(m: &Meta) -> (i64, i64, i64, i64) {
+fn leaf_totals(m: &Meta) -> [i64; 5] {
     let n = m.nlink.max(1);
-    // "Files" means regular files, as in qdirstat; links and devices aren't.
-    (
+    // "Files" means regular files, as in qdirstat; links and devices aren't,
+    // but every entry counts as an item.
+    [
         (m.size / n) as i64,
         (m.alloc / n) as i64,
         i64::from(m.kind == Kind::File),
         0,
-    )
+        1,
+    ]
 }
 
-const INSERT_COLS: usize = 18;
+const INSERT_COLS: usize = 19;
 
 /// Rows per INSERT statement; one statement per row spent most of a first
 /// scan in per-statement setup.
@@ -445,10 +453,10 @@ impl Inserter {
     ) -> Result<()> {
         // Files store no totals (0 takes no space); directories compute a
         // file's share from size, alloc and nlink when summing.
-        let (ts, ta, tf, td) = if m.kind == Kind::Dir {
-            (0, 0, 0, 1)
+        let (ts, ta, tf, td, ti) = if m.kind == Kind::Dir {
+            (0, 0, 0, 1, 1)
         } else {
-            (0, 0, 0, 0)
+            (0, 0, 0, 0, 0)
         };
         self.params.extend([
             Value::Integer(id),
@@ -469,6 +477,7 @@ impl Inserter {
             Value::Integer(ta),
             Value::Integer(tf),
             Value::Integer(td),
+            Value::Integer(ti),
         ]);
         self.rows += 1;
         if self.rows == INSERT_BATCH {
@@ -484,7 +493,7 @@ impl Inserter {
         let row = format!("({})", vec!["?"; INSERT_COLS].join(","));
         let sql = format!(
             "INSERT INTO entries (id, parent, name, kind, mode, uid, gid, size, alloc, nlink, \
-             dev, ino, mtime_ns, ctime_ns, t_size, t_alloc, t_files, t_dirs) VALUES {}",
+             dev, ino, mtime_ns, ctime_ns, t_size, t_alloc, t_files, t_dirs, t_items) VALUES {}",
             vec![row.as_str(); self.rows].join(",")
         );
         exec(conn, sql, std::mem::take(&mut self.params)).await?;
@@ -589,6 +598,19 @@ impl Index {
                 &conn,
                 "INSERT OR REPLACE INTO meta (key, value) VALUES ('layout', ?1)",
                 (LAYOUT_VERSION,),
+            )
+            .await?;
+        }
+        // Indexes from before item counts: add the column; the totals
+        // version below then fills it in.
+        if query(&conn, "SELECT t_items FROM entries LIMIT 0", ())
+            .await
+            .is_err()
+        {
+            exec(
+                &conn,
+                "ALTER TABLE entries ADD COLUMN t_items INTEGER NOT NULL DEFAULT 0",
+                (),
             )
             .await?;
         }
@@ -1185,6 +1207,8 @@ impl Index {
                      (SELECT coalesce(sum(CASE WHEN kind = 1 THEN t_files WHEN kind = 0 THEN 1 \
                         ELSE 0 END), 0) FROM entries WHERE parent = e.id), \
                      (SELECT coalesce(sum(CASE WHEN kind = 1 THEN t_dirs ELSE 0 END), 0) \
+                        FROM entries WHERE parent = e.id), \
+                     (SELECT coalesce(sum(CASE WHEN kind = 1 THEN t_items ELSE 1 END), 0) \
                         FROM entries WHERE parent = e.id) \
                      FROM entries e WHERE e.id = ?1",
                 (id,),
@@ -1198,12 +1222,14 @@ impl Index {
                 int(&row, 1)? + int(&row, 3)?,
                 int(&row, 4)?,
                 int(&row, 5)? + 1,
+                int(&row, 6)? + 1,
             );
             drop(rows);
             exec(
                 conn,
-                "UPDATE entries SET t_size=?1, t_alloc=?2, t_files=?3, t_dirs=?4 WHERE id=?5",
-                (vals.0, vals.1, vals.2, vals.3, id),
+                "UPDATE entries SET t_size=?1, t_alloc=?2, t_files=?3, t_dirs=?4, t_items=?5 \
+                 WHERE id=?6",
+                (vals.0, vals.1, vals.2, vals.3, vals.4, id),
             )
             .await?;
         }
@@ -1218,26 +1244,32 @@ impl Index {
         // because a leaf can come before its directory in the table.
         let mut ids: Vec<i64> = Vec::new();
         let mut parent_ids: Vec<i64> = Vec::new();
-        let mut totals: Vec<[i64; 4]> = Vec::new();
-        let mut stored: Vec<[i64; 4]> = Vec::new();
+        let mut totals: Vec<[i64; 5]> = Vec::new();
+        let mut stored: Vec<[i64; 5]> = Vec::new();
         let mut slot: HashMap<i64, u32> = HashMap::new();
-        let mut leaf_sums: HashMap<i64, [i64; 4]> = HashMap::new();
+        let mut leaf_sums: HashMap<i64, [i64; 5]> = HashMap::new();
         let mut rows = query(
             conn,
-            "SELECT id, parent, kind, size, alloc, nlink, t_size, t_alloc, t_files, t_dirs \
-             FROM entries",
+            "SELECT id, parent, kind, size, alloc, nlink, t_size, t_alloc, t_files, t_dirs, \
+             t_items FROM entries",
             (),
         )
         .await?;
         while let Some(row) = rows.next().await? {
             let (id, parent) = (int(&row, 0)?, int(&row, 1)?);
             let kind = Kind::from_i64(int(&row, 2)?);
-            let was = [int(&row, 6)?, int(&row, 7)?, int(&row, 8)?, int(&row, 9)?];
+            let was = [
+                int(&row, 6)?,
+                int(&row, 7)?,
+                int(&row, 8)?,
+                int(&row, 9)?,
+                int(&row, 10)?,
+            ];
             if kind == Kind::Dir {
                 slot.insert(id, ids.len() as u32);
                 ids.push(id);
                 parent_ids.push(parent);
-                totals.push([int(&row, 3)?, int(&row, 4)?, 0, 1]);
+                totals.push([int(&row, 3)?, int(&row, 4)?, 0, 1, 1]);
                 stored.push(was);
                 continue;
             }
@@ -1254,10 +1286,9 @@ impl Index {
                 mtime_ns: 0,
                 ctime_ns: 0,
             };
-            let (a, b, c, d) = leaf_totals(&meta);
-            let t = [a, b, c, d];
+            let t = leaf_totals(&meta);
             let sum = leaf_sums.entry(parent).or_default();
-            for i in 0..4 {
+            for i in 0..5 {
                 sum[i] += t[i];
             }
         }
@@ -1265,7 +1296,7 @@ impl Index {
 
         for (i, id) in ids.iter().enumerate() {
             if let Some(sum) = leaf_sums.remove(id) {
-                for k in 0..4 {
+                for k in 0..5 {
                     totals[i][k] += sum[k];
                 }
             }
@@ -1301,11 +1332,12 @@ impl Index {
         drop(depth);
 
         let mut written = 0usize;
-        let mut write = async |id: i64, t: [i64; 4]| -> Result<()> {
+        let mut write = async |id: i64, t: [i64; 5]| -> Result<()> {
             exec(
                 conn,
-                "UPDATE entries SET t_size=?1, t_alloc=?2, t_files=?3, t_dirs=?4 WHERE id=?5",
-                (t[0], t[1], t[2], t[3], id),
+                "UPDATE entries SET t_size=?1, t_alloc=?2, t_files=?3, t_dirs=?4, t_items=?5 \
+                 WHERE id=?6",
+                (t[0], t[1], t[2], t[3], t[4], id),
             )
             .await?;
             written += 1;
@@ -1323,7 +1355,7 @@ impl Index {
             let t = totals[i];
             let p = parent_slot[i];
             if p != u32::MAX {
-                for k in 0..4 {
+                for k in 0..5 {
                     totals[p as usize][k] += t[k];
                 }
             }

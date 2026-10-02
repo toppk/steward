@@ -153,6 +153,16 @@ Hashing seems stuck
 :   The daemon isn't running, or `XDG_RUNTIME_DIR` differs between the
     daemon and the client (common in `sudo` or `ssh` sessions).
 
+Out of inodes, or "No space left on device" with space free
+:   Something has created a great many small files. Find where:
+    `steward tree ~ -d 3 --by items`, or **Rank by Items** in the desktop
+    app. On btrfs there is no inode limit; small files exhaust *metadata*
+    space instead, and `steward settings | jq '.roots[].fs'` (or the Daemon
+    tab) shows its use. To survey a disk your user can't read, such as a
+    backup volume, index it once as root into a scratch file and explore that:
+    `steward --db /root/backup.db scan /backup`, then
+    `steward --db /root/backup.db tree /backup -d 3 --by items`.
+
 Something is changed on disk, but steward hasn't noticed
 :   steward doesn't watch for changes. The next scheduled scan will notice;
     `steward scan PATH` or `steward inspect PATH` notices now. Files

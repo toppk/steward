@@ -106,6 +106,39 @@ pub fn now() -> f64 {
         .map_or(0.0, |d| d.as_secs_f64())
 }
 
+/// A filesystem's fullness from `settings`' `fs`: space, inodes where the
+/// filesystem has a fixed number, btrfs metadata where it reports it. The
+/// flag says whether anything is nearly exhausted.
+pub fn filesystem(fs: &serde_json::Value) -> Option<(String, bool)> {
+    let n = |k: &str| fs[k].as_u64();
+    let (total, free) = (n("bytes_total")?, n("bytes_free")?);
+    let used = |t: u64, f: u64| {
+        if t == 0 {
+            0.0
+        } else {
+            (t - f.min(t)) as f64 * 100.0 / t as f64
+        }
+    };
+    let space = used(total, free);
+    let mut parts = vec![format!("{space:.0}% full, {} free", bytes(free))];
+    let mut worst = space;
+    if let (Some(t), Some(f)) = (n("inodes_total"), n("inodes_free")) {
+        let p = used(t, f);
+        worst = worst.max(p);
+        parts.push(format!("inodes {p:.0}% used, {} free", count(f)));
+    }
+    if let (Some(t), Some(u)) = (n("metadata_total"), n("metadata_used")) {
+        let p = if t == 0 {
+            0.0
+        } else {
+            u as f64 * 100.0 / t as f64
+        };
+        worst = worst.max(p);
+        parts.push(format!("metadata {p:.0}% of {} allocated", bytes(t)));
+    }
+    Some((parts.join(" · "), worst >= 95.0))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

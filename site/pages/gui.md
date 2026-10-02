@@ -16,7 +16,8 @@ The path picks the root to show first and the folder to open in it. The app
 needs a running daemon. Warnings it shows in colour are also written to
 stderr (`steward-ui: warning: …`), so they can be copied.
 
-Across the top are the **roots**, one button each. Hover for a root's totals.
+Across the top are the **roots**, one button each. Hover for a root's totals
+and how full its filesystem is.
 A root whose volume isn't mounted says *(offline)* and shows the index as it
 was last scanned. On the right, badges appear while the daemon is
 **scanning** or **hashing**. Click either for the details in the Daemon tab.
@@ -27,6 +28,11 @@ A qdirstat-style view of the current root: every directory with its space on
 disk, its share of the parent, a bar, its file count, and tags such as
 `classify:repo` or `classify:build-output` (build output, caches and
 dependencies in amber, trash in red). Children are sorted largest first.
+
+**Rank by Space | Items** switches what the tree sorts, bars and
+percentages by. Items counts every entry beneath (files, directories,
+symlinks), which is what fills a filesystem's inodes or btrfs metadata.
+Expanded folders and the selection are kept.
 
 Selecting an entry shows its details: path, mode, owner, space on disk and
 apparent size, counts, and its content id if it has one. **All locations**
@@ -42,6 +48,7 @@ opens the Content ids tab on every path holding the same bytes.
 | <kbd>g</kbd> | make the selected directory the top of the view |
 | <kbd>Backspace</kbd> or <kbd>u</kbd> | go up a level |
 | <kbd>r</kbd> or <kbd>F5</kbd> | rescan the selected directory |
+| <kbd>i</kbd> | rank by space or by items |
 | <kbd>/</kbd> or <kbd>Ctrl</kbd>+<kbd>F</kbd> | locate: find by name across the index |
 
 Locate takes a substring, or a glob such as `*.CR3`. Move through the results
@@ -90,7 +97,9 @@ Warnings and errors
 
 Roots
 :   Each root's state (indexed, offline, not scanned yet), its totals, its
-    rescan interval and when the next scan is due.
+    rescan interval, when the next scan is due, and its filesystem: how full,
+    free inodes where the filesystem has a fixed number, and btrfs metadata
+    use. Anything above 95% is shown in amber.
 
 Recent scans
 :   The last 50 scans: when, what, full or trusting, how long, how many

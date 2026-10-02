@@ -48,13 +48,9 @@ enum Cmd {
         contentid: Vec<PathBuf>,
     },
     /// Remove a root from settings.toml and the index.
-    RemoveRoot {
-        path: PathBuf,
-    },
+    RemoveRoot { path: PathBuf },
     /// Content-id coverage and duplication under PATH.
-    ContentSummary {
-        path: PathBuf,
-    },
+    ContentSummary { path: PathBuf },
     /// BEP-52 piece layer of a content id (hex), from the stored 1 MiB layer.
     PieceLayer {
         id: String,
@@ -70,12 +66,13 @@ enum Cmd {
         trust: bool,
     },
     /// Tell the daemon something under PATH changed.
-    Invalidate {
-        path: PathBuf,
-    },
+    Invalidate { path: PathBuf },
     /// Children of a directory, largest first.
     Ls {
         path: PathBuf,
+        /// Rank by space on disk, or by items (entries beneath: roughly inodes).
+        #[arg(short, long, value_enum, default_value_t = By::Space)]
+        by: By,
     },
     /// qdirstat-style tree, largest first.
     Tree {
@@ -84,11 +81,12 @@ enum Cmd {
         depth: u32,
         #[arg(short, long, default_value_t = 10)]
         top: usize,
+        /// Rank by space on disk, or by items (entries beneath: roughly inodes).
+        #[arg(short, long, value_enum, default_value_t = By::Space)]
+        by: By,
     },
     /// One entry: its stat fields, subtree totals, tags and content id.
-    Stat {
-        path: PathBuf,
-    },
+    Stat { path: PathBuf },
     /// Find entries by name: substring, or glob if it has * ? [.
     Locate {
         pattern: String,
@@ -96,21 +94,13 @@ enum Cmd {
         limit: u32,
     },
     /// Re-run classification (repositories, build output, caches…) under PATH.
-    Classify {
-        path: PathBuf,
-    },
+    Classify { path: PathBuf },
     /// BitTorrent v2 content id of a file.
-    Cid {
-        path: PathBuf,
-    },
+    Cid { path: PathBuf },
     /// Compute missing content ids under a path.
-    Hash {
-        path: PathBuf,
-    },
+    Hash { path: PathBuf },
     /// Paths whose content has this id.
-    Find {
-        id: String,
-    },
+    Find { id: String },
     /// Duplicate content under a path, most wasted space first.
     Dups {
         path: PathBuf,
@@ -131,9 +121,7 @@ enum Cmd {
         recheck: bool,
     },
     /// Update the index for these paths now and give their content ids.
-    Inspect {
-        paths: Vec<PathBuf>,
-    },
+    Inspect { paths: Vec<PathBuf> },
     /// Print content and storage events as they happen (one JSON per line).
     Events {
         /// Replay the daemon's backlog after this sequence number first.
@@ -184,11 +172,48 @@ fn name(e: &Entry) -> &str {
     e.path.rsplit('/').next().unwrap_or(&e.path)
 }
 
-fn line(e: &Entry, parent_alloc: u64, indent: usize) {
-    let pct = if parent_alloc == 0 {
+/// What `tree` and `ls` rank by.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum By {
+    /// Space on disk.
+    Space,
+    /// Entries beneath: files, directories, symlinks and the rest. Roughly
+    /// the inodes (or, on btrfs, the metadata) a subtree uses.
+    Items,
+}
+
+impl By {
+    fn of(self, e: &Entry) -> u64 {
+        match self {
+            Self::Space => e.total_alloc,
+            Self::Items => e.total_items,
+        }
+    }
+
+    fn show(self, n: u64) -> String {
+        match self {
+            Self::Space => human(n),
+            Self::Items => count(n),
+        }
+    }
+}
+
+/// An item count in at most 6 characters: 438, 9512, 41.7k, 15.2M.
+fn count(n: u64) -> String {
+    match n {
+        0..10_000 => n.to_string(),
+        10_000..1_000_000 => format!("{:.1}k", n as f64 / 1e3),
+        1_000_000..1_000_000_000 => format!("{:.1}M", n as f64 / 1e6),
+        _ => format!("{:.1}G", n as f64 / 1e9),
+    }
+}
+
+fn line(e: &Entry, parent: &Entry, by: By, indent: usize) {
+    let whole = by.of(parent);
+    let pct = if whole == 0 {
         0.0
     } else {
-        e.total_alloc as f64 * 100.0 / parent_alloc as f64
+        by.of(e) as f64 * 100.0 / whole as f64
     };
     let bar = "#".repeat((pct / 10.0).round() as usize);
     let slash = if matches!(e.kind, steward_proto::Kind::Dir) {
@@ -200,12 +225,17 @@ fn line(e: &Entry, parent_alloc: u64, indent: usize) {
     if let Some(c) = &e.category {
         extra.push_str(c);
     }
+    // The other measure goes in the last column.
+    let other = match by {
+        By::Space => e.total_files.to_string(),
+        By::Items => human(e.total_alloc),
+    };
     out!(
         "{:>8} {:>5.1}% {:<10} {:>8} {}{}{}  {}",
-        human(e.total_alloc),
+        by.show(by.of(e)),
         pct,
         bar,
-        e.total_files,
+        other,
         "  ".repeat(indent),
         name(e),
         slash,
@@ -261,21 +291,22 @@ impl Backend {
     }
 }
 
-fn tree(c: &mut Backend, e: &Entry, depth: u32, top: usize, indent: usize) -> Result<()> {
+fn tree(c: &mut Backend, e: &Entry, depth: u32, top: usize, by: By, indent: usize) -> Result<()> {
     if depth == 0 || !matches!(e.kind, steward_proto::Kind::Dir) {
         return Ok(());
     }
-    let kids = c.children(PathBuf::from(&e.path))?;
+    let mut kids = c.children(PathBuf::from(&e.path))?;
+    kids.sort_by_key(|k| std::cmp::Reverse(by.of(k)));
     let rest = kids.len().saturating_sub(top);
     for k in kids.iter().take(top) {
-        line(k, e.total_alloc, indent);
-        tree(c, k, depth - 1, top, indent + 1)?;
+        line(k, e, by, indent);
+        tree(c, k, depth - 1, top, by, indent + 1)?;
     }
     if rest > 0 {
-        let bytes: u64 = kids.iter().skip(top).map(|k| k.total_alloc).sum();
+        let sum: u64 = kids.iter().skip(top).map(|k| by.of(k)).sum();
         out!(
             "{:>8} {:>18} {}… {rest} more",
-            human(bytes),
+            by.show(sum),
             "",
             "  ".repeat(indent)
         );
@@ -329,20 +360,27 @@ fn run(cli: Cli) -> Result<()> {
             trust_dir_mtime: trust,
         })?,
         Cmd::Invalidate { path } => c.request(&Request::Invalidate { path: abs(path)? })?,
-        Cmd::Ls { path } => {
+        Cmd::Ls { path, by } => {
             let path = abs(path)?;
             let me: Entry =
                 serde_json::from_value(c.request(&Request::Stat { path: path.clone() })?)?;
-            for k in c.children(path)? {
-                line(&k, me.total_alloc, 0);
+            let mut kids = c.children(path)?;
+            kids.sort_by_key(|k| std::cmp::Reverse(by.of(k)));
+            for k in &kids {
+                line(k, &me, by, 0);
             }
             return Ok(());
         }
-        Cmd::Tree { path, depth, top } => {
+        Cmd::Tree {
+            path,
+            depth,
+            top,
+            by,
+        } => {
             let me: Entry =
                 serde_json::from_value(c.request(&Request::Stat { path: abs(path)? })?)?;
-            line(&me, me.total_alloc, 0);
-            return tree(&mut c, &me, depth, top, 1);
+            line(&me, &me, by, 0);
+            return tree(&mut c, &me, depth, top, by, 1);
         }
         Cmd::Stat { path } => c.request(&Request::Stat { path: abs(path)? })?,
         Cmd::Locate { pattern, limit } => {
