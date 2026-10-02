@@ -48,7 +48,7 @@ Paths may be relative; `steward` makes them absolute before sending them.
         1.4G   9.9% #              2779   virtio-win/
       987.0M   7.1% #             17019   cursor/
       970.1M   7.0% #              2594   code/
-        6.5G                      … 469 more
+        6.5G                      ... 469 more
     ```
 
     The columns are space on disk, share of the parent, a bar, and the
@@ -65,7 +65,7 @@ Paths may be relative; `steward` makes them absolute before sending them.
        58.4k  15.0% #            172.9M   icons/
        43.3k  11.1% #            655.4M   doc/
        37.9k   9.7% #            183.5M   help/
-      250.7k                      … 470 more
+      250.7k                      ... 470 more
     ```
 
 `steward stat PATH`

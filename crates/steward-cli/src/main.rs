@@ -305,7 +305,7 @@ fn tree(c: &mut Backend, e: &Entry, depth: u32, top: usize, by: By, indent: usiz
     if rest > 0 {
         let sum: u64 = kids.iter().skip(top).map(|k| by.of(k)).sum();
         out!(
-            "{:>8} {:>18} {}… {rest} more",
+            "{:>8} {:>18} {}... {rest} more",
             by.show(sum),
             "",
             "  ".repeat(indent)

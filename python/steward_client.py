@@ -124,6 +124,8 @@ class Entry:
     total_alloc: int
     total_files: int
     total_dirs: int
+    # Every entry beneath, itself included: roughly the inodes it uses.
+    total_items: int = 0
     tags: list[str] = field(default_factory=list)
     category: str | None = None
     content_id: str | None = None
