@@ -13,7 +13,7 @@ use gpui_kit::{
 };
 use gpui_omarchy::{
     ActiveTheme as _, ButtonVariant, Status, Theme, alert, badge, button, empty_state, input,
-    progress, with_tooltip,
+    progress, scrollbar, with_tooltip,
 };
 use serde_json::Value;
 use steward_proto::Request;
@@ -47,6 +47,7 @@ pub struct ContentView {
     lookup_input: Entity<InputState>,
     /// The id looked up, and its locations once the daemon answers.
     lookup: Option<(String, Option<Fetched<Vec<String>>>)>,
+    scroll: gpui_kit::ScrollHandle,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -73,6 +74,7 @@ impl ContentView {
             hashing: HashSet::new(),
             lookup_input,
             lookup: None,
+            scroll: gpui_kit::ScrollHandle::new(),
             _subscriptions: vec![sub],
         }
     }
@@ -459,11 +461,12 @@ impl Render for ContentView {
         };
         body = body.child(dups);
 
-        div()
+        let page = div()
             .id("content-view")
             .track_focus(&self.focus)
             .size_full()
             .overflow_y_scroll()
+            .track_scroll(&self.scroll)
             .child(
                 div()
                     .flex()
@@ -476,7 +479,18 @@ impl Render for ContentView {
                             .on_click(cx.listener(|this, _, _, cx| this.refresh(cx))),
                     ),
             )
-            .child(body)
+            .child(body);
+        div()
+            .relative()
+            .size_full()
+            .child(page)
+            .child(scrollbar(
+                "content-scrollbar",
+                gpui_kit::base::ScrollbarAxis::Vertical,
+                &self.scroll,
+                window,
+                cx,
+            ))
             .into_any_element()
     }
 }

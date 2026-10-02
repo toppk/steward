@@ -8,8 +8,8 @@ use gpui_kit::{
     SharedString, StatefulInteractiveElement as _, Styled as _, Window, div, rems,
 };
 use gpui_omarchy::{
-    ActiveTheme as _, ButtonVariant, Status, Theme, alert, badge, button, progress, switch,
-    with_tooltip,
+    ActiveTheme as _, ButtonVariant, Status, Theme, alert, badge, button, progress, scrollbar,
+    switch, with_tooltip,
 };
 use serde_json::Value;
 
@@ -29,6 +29,7 @@ pub struct DaemonView {
     auto_gen: u64,
     show_all_events: bool,
     show_all_problems: bool,
+    scroll: gpui_kit::ScrollHandle,
 }
 
 impl DaemonView {
@@ -41,6 +42,7 @@ impl DaemonView {
             auto_gen: 0,
             show_all_events: false,
             show_all_problems: false,
+            scroll: gpui_kit::ScrollHandle::new(),
         }
     }
 
@@ -638,7 +640,7 @@ impl DaemonView {
 }
 
 impl Render for DaemonView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
         let theme = cx.omarchy().clone();
         let taken = match &self.snap {
             Some(Ok(s)) => format!(
@@ -715,11 +717,24 @@ impl Render for DaemonView {
         self.snap = snap;
 
         div()
-            .id("daemon-view")
-            .track_focus(&self.focus)
+            .relative()
             .size_full()
-            .overflow_y_scroll()
-            .child(toolbar)
-            .child(body)
+            .child(
+                div()
+                    .id("daemon-view")
+                    .track_focus(&self.focus)
+                    .size_full()
+                    .overflow_y_scroll()
+                    .track_scroll(&self.scroll)
+                    .child(toolbar)
+                    .child(body),
+            )
+            .child(scrollbar(
+                "daemon-scrollbar",
+                gpui_kit::base::ScrollbarAxis::Vertical,
+                &self.scroll,
+                window,
+                cx,
+            ))
     }
 }

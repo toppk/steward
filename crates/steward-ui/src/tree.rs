@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use gpui_kit::base::ScrollbarAxis;
 use gpui_kit::base::input::{InputEvent, InputState};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
@@ -9,7 +10,9 @@ use gpui_kit::{
     ScrollStrategy, SharedString, StatefulInteractiveElement as _, Styled as _, Subscription,
     UniformListScrollHandle, Window, div, relative, rems, uniform_list,
 };
-use gpui_omarchy::{ActiveTheme as _, ButtonVariant, Theme, button, input, with_tooltip};
+use gpui_omarchy::{
+    ActiveTheme as _, ButtonVariant, Theme, button, input, scrollbar, with_tooltip,
+};
 use steward_proto::{Entry, Kind, Request};
 
 use crate::client::{fetch, print_info, print_warning, scanning};
@@ -34,7 +37,8 @@ const COL_SIZE: Rems = Rems(6.5);
 const COL_COUNT: Rems = Rems(9.0);
 const COL_DATE: Rems = Rems(6.5);
 const COL_TAGS: Rems = Rems(12.0);
-const LOCATE_LIMIT: u32 = 2000;
+/// Locate results shown; the list only draws what is on screen.
+const LOCATE_LIMIT: u32 = 100_000;
 
 #[derive(Clone, Debug)]
 struct Row {
@@ -460,7 +464,7 @@ impl TreeView {
                             "{} matches for {pattern}{}",
                             format::count(hits.len() as u64),
                             if hits.len() as u32 == LOCATE_LIMIT {
-                                " (limit reached)"
+                                " (stopped at the limit: narrow the pattern)"
                             } else {
                                 ""
                             }
@@ -827,7 +831,7 @@ impl Render for TreeView {
                 }),
             )
             .track_scroll(&self.scroll)
-            .flex_1(),
+            .size_full(),
             Mode::Locate => uniform_list(
                 "hits",
                 self.hits.len(),
@@ -865,8 +869,27 @@ impl Render for TreeView {
                 }),
             )
             .track_scroll(&self.hit_scroll)
-            .flex_1(),
+            .size_full(),
         };
+        // The list fills what the toolbar and header leave, with a scrollbar
+        // over its right edge on the same scroll handle.
+        let bar = match self.mode {
+            Mode::Tree => scrollbar(
+                "tree-scrollbar",
+                ScrollbarAxis::Vertical,
+                &self.scroll,
+                window,
+                cx,
+            ),
+            Mode::Locate => scrollbar(
+                "hits-scrollbar",
+                ScrollbarAxis::Vertical,
+                &self.hit_scroll,
+                window,
+                cx,
+            ),
+        };
+        let list = div().relative().flex_1().min_h_0().child(list).child(bar);
 
         let up_root = self.root.clone();
         let toolbar = div()

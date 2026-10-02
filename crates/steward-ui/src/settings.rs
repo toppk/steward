@@ -12,7 +12,7 @@ use gpui_kit::{
 };
 use gpui_omarchy::{
     ActiveTheme as _, ButtonVariant, Status, Theme, alert, badge, button, input, number_input,
-    switch,
+    scrollbar, switch,
 };
 use steward_proto::{Request, RootSettings};
 
@@ -49,6 +49,7 @@ pub struct SettingsView {
     status: Option<(Status, String)>,
     confirm_remove: bool,
     busy: bool,
+    scroll: gpui_kit::ScrollHandle,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -106,6 +107,7 @@ impl SettingsView {
             status: None,
             confirm_remove: false,
             busy: false,
+            scroll: gpui_kit::ScrollHandle::new(),
             _subscriptions: subs,
         }
     }
@@ -660,10 +662,24 @@ impl Render for SettingsView {
             .child(list)
             .child(
                 div()
-                    .id("settings-form")
+                    .relative()
                     .flex_1()
-                    .overflow_y_scroll()
-                    .child(form),
+                    .min_w_0()
+                    .child(
+                        div()
+                            .id("settings-form")
+                            .size_full()
+                            .overflow_y_scroll()
+                            .track_scroll(&self.scroll)
+                            .child(form),
+                    )
+                    .child(scrollbar(
+                        "settings-scrollbar",
+                        gpui_kit::base::ScrollbarAxis::Vertical,
+                        &self.scroll,
+                        window,
+                        cx,
+                    )),
             )
     }
 }
