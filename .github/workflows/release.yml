@@ -83,7 +83,7 @@ jobs:
           if-no-files-found: error
 
   publish:
-    name: Publish ${{ inputs.tag || github.ref_name }}
+    name: Publish
     needs: build
     if: ${{ !inputs.dry_run }}
     runs-on: ubuntu-24.04
