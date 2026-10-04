@@ -1,6 +1,6 @@
 # steward
 
-> steward is a per-user file index service for Linux. A daemon (stewardd) keeps an index of every path under the user's configured roots (lstat fields and directory subtree totals), classifies directories and files (git repositories, ignored build output, caches, file categories), and computes content ids (the BitTorrent v2 / BEP 52 Merkle root of each file's bytes). Applications query it with JSON-RPC 2.0 over Unix sockets in $XDG_RUNTIME_DIR/steward/: content.socket for applications, api.socket for administration. steward only reads the files it indexes; it never modifies them.
+> steward is a per-user file index service for Linux. A daemon (`steward daemon`, usually a systemd user service) keeps an index of every path under the user's configured roots (lstat fields and directory subtree totals), classifies directories and files (git repositories, ignored build output, caches, file categories), and computes content ids (the BitTorrent v2 / BEP 52 Merkle root of each file's bytes). Applications query it with JSON-RPC 2.0 over Unix sockets in $XDG_RUNTIME_DIR/steward/: content.socket for applications, api.socket for administration. steward only reads the files it indexes; it never modifies them.
 
 Every page below is Markdown. llms-full.txt has all of them in one file.
 

@@ -6,4 +6,5 @@ pub mod config;
 pub mod engine;
 pub mod events;
 pub mod qdirstat;
+pub mod server;
 pub mod settings_file;

@@ -9,6 +9,13 @@
 
 use std::path::PathBuf;
 
+/// This build's version: the release tag (`v0.2.0`) for release builds,
+/// which set `STEWARD_VERSION` when compiling, and `dev` otherwise.
+pub const VERSION: &str = match option_env!("STEWARD_VERSION") {
+    Some(v) => v,
+    None => "dev",
+};
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -426,7 +433,10 @@ impl Client {
         let writer = std::os::unix::net::UnixStream::connect(path).map_err(|e| {
             std::io::Error::new(
                 e.kind(),
-                format!("connecting to stewardd at {}: {e}", path.display()),
+                format!(
+                    "connecting to the steward daemon at {}: {e}",
+                    path.display()
+                ),
             )
         })?;
         Ok(Self {

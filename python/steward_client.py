@@ -451,7 +451,7 @@ class Client:
             self._sock.connect(self.path)
         except OSError as e:
             self._sock.close()
-            raise ConnectionLost(f"connecting to stewardd at {self.path}: {e}") from e
+            raise ConnectionLost(f"connecting to the steward daemon at {self.path}: {e}") from e
         self._reader = self._sock.makefile("rb")
 
     def close(self) -> None:
@@ -619,7 +619,7 @@ class _Connection:
                 self.path, limit=_LINE_LIMIT
             )
         except OSError as e:
-            raise ConnectionLost(f"connecting to stewardd at {self.path}: {e}") from e
+            raise ConnectionLost(f"connecting to the steward daemon at {self.path}: {e}") from e
         self._task = asyncio.get_running_loop().create_task(self._read_loop(reader))
 
     async def _read_loop(self, reader: asyncio.StreamReader) -> None:

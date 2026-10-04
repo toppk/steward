@@ -5,48 +5,58 @@ lede: Build steward, run it as a user service, point it at your files and ask it
 description: Build, install and configure steward, then run your first queries.
 ---
 
-## Requirements
+## Install
 
-- **Linux.** steward relies on Linux filesystem identities (`statvfs`'s
-  `f_fsid`) and per-user runtime directories (`$XDG_RUNTIME_DIR`).
-- **Rust 1.97 or newer** and Cargo, to build.
-- **[just](https://github.com/casey/just)**, for the short commands below
-  (optional; each recipe is a plain `cargo` or `install` command).
-- For the desktop app only: the GPUI build dependencies. On Fedora,
-  `just deps` installs them.
+steward runs on Linux, on x86_64 and ARM64. Install the latest release into
+`~/.local/bin`, without root:
 
-## Build and install
+```sh
+curl -fsSL https://toppk.github.io/steward/install.sh | sh
+```
+
+The installer downloads the release for your machine, verifies its SHA-256
+checksums, and installs:
+
+| program | what it is |
+|---|---|
+| `steward` | the command line, and the daemon (`steward daemon`) that scans, classifies, hashes and answers requests |
+| `steward-ui` | the desktop app, installed where the X11/Wayland keyboard libraries are present (`STEWARD_UI=1` or `0` decides) |
+
+It only ever replaces earlier steward builds, and never an unrelated program
+of the same name. Read [the script](install.sh) first if you like. Set
+`STEWARD_INSTALL_DIR` to install somewhere else.
+
+Then run the daemon as a systemd **user** service, now and at every login:
+
+```sh
+steward service install
+steward service logs -f      # watch it work
+```
+
+`steward service install` writes `~/.config/systemd/user/steward.service`
+for the installed `steward`, enables it and starts it. The service runs at
+`Nice=10` with idle I/O priority, so scans and hashing yield to everything
+else. To keep it running while you're logged out, enable lingering
+(`loginctl enable-linger`).
+
+**Upgrading** is `steward upgrade`: it installs the latest release the same
+way and restarts the service. `steward version` shows the version of both
+the command and the running daemon.
+
+### From source
+
+You need Rust 1.97 or newer, [just](https://github.com/casey/just) and, for
+the desktop app, the GPUI build dependencies (`just deps` installs them on
+Fedora). Then:
 
 ```sh
 git clone https://github.com/toppk/steward
 cd steward
-just install
+just install        # builds, installs to ~/.local/bin, runs `steward service install`
 ```
 
-`just install` builds in release mode and installs three programs into
-`~/.local/bin`:
-
-| program | what it is |
-|---|---|
-| `stewardd` | the daemon: scans, classifies, hashes, answers requests |
-| `steward` | the command line client |
-| `steward-ui` | the desktop app |
-
-It also installs a systemd **user** unit, `stewardd.service`. Start it, and
-have it start with every login session:
-
-```sh
-systemctl --user enable --now stewardd
-journalctl --user -u stewardd -f      # watch it work (or: just logs)
-```
-
-The unit runs the daemon at `Nice=10` with idle I/O priority, so scans and
-hashing yield to everything else.
-
-::: tip
-To try steward without installing anything, run the daemon in a terminal
-with `just daemon -v` and use `just cli …` in another one.
-:::
+To try it without installing, run `just daemon -v` in one terminal and
+`just cli …` in another.
 
 ## Choose what to index
 
@@ -135,9 +145,9 @@ opens directly.
 ## Uninstall
 
 ```sh
-just uninstall
+steward service uninstall                       # stop, disable and remove the unit
+rm ~/.local/bin/steward ~/.local/bin/steward-ui
 ```
 
-This stops the service and removes the programs and the unit. Your
-settings (`~/.config/steward/`) and the index (`~/.local/state/steward/`)
+Your settings (`~/.config/steward/`) and the index (`~/.local/state/steward/`)
 stay; delete them yourself if you want them gone.

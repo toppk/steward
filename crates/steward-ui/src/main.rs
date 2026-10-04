@@ -15,6 +15,19 @@ use std::path::PathBuf;
 use gpui_kit::{AppContext as _, Bounds, WindowBounds, WindowOptions, point, px, size};
 
 fn main() {
+    if let Some(arg) = std::env::args().nth(1) {
+        match arg.as_str() {
+            "--version" | "-V" => {
+                println!("steward-ui {}", steward_proto::VERSION);
+                return;
+            }
+            "--help" | "-h" => {
+                println!("steward-ui [FOLDER]: the steward desktop app (needs a running daemon)");
+                return;
+            }
+            _ => {}
+        }
+    }
     steward_log::init(steward_log::Level::INFO, 0, false);
     let root = std::env::args_os()
         .nth(1)

@@ -1,3 +1,5 @@
+mod service;
+
 use std::path::PathBuf;
 
 use anyhow::Result;
@@ -8,7 +10,11 @@ use stewardd::config::Config;
 use stewardd::engine::Engine;
 
 #[derive(Parser)]
-#[command(name = "steward", about = "Query and drive the steward file index")]
+#[command(
+    name = "steward",
+    about = "steward: a file index service for Linux applications",
+    version = steward_proto::VERSION
+)]
 struct Cli {
     /// Work directly on this index file instead of through stewardd.
     #[arg(long, global = true, env = "STEWARD_DB")]
@@ -22,6 +28,23 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Run the daemon in the foreground (what the service runs).
+    Daemon,
+    /// Install and control the systemd user service that runs the daemon.
+    Service {
+        #[command(subcommand)]
+        action: ServiceCmd,
+    },
+    /// Open the desktop app (steward-ui).
+    Ui {
+        /// Passed to steward-ui: the folder to open.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<std::ffi::OsString>,
+    },
+    /// This program's version, and the running daemon's.
+    Version,
+    /// Install the latest release over this one and restart the service.
+    Upgrade,
     /// Indexed roots and daemon state.
     Status,
     /// Re-read settings.toml: add new roots, prune removed ones.
@@ -314,10 +337,42 @@ fn tree(c: &mut Backend, e: &Entry, depth: u32, top: usize, by: By, indent: usiz
     Ok(())
 }
 
+#[derive(Subcommand)]
+enum ServiceCmd {
+    /// Write ~/.config/systemd/user/steward.service for this program, enable
+    /// it and (re)start it.
+    Install,
+    /// Stop, disable and remove the unit (the index and settings stay).
+    Uninstall,
+    /// Start the service now.
+    Start,
+    /// Stop the service (it starts again at the next login unless uninstalled).
+    Stop,
+    /// Restart the service, e.g. after an upgrade.
+    Restart,
+    /// systemd's view of the service: running, since when, recent log lines.
+    Status,
+    /// The daemon's log, from the journal.
+    Logs {
+        /// Keep printing new lines.
+        #[arg(short, long)]
+        follow: bool,
+    },
+}
+
 fn main() -> std::process::ExitCode {
     let cli = Cli::parse();
-    steward_log::init(steward_log::Level::WARN, cli.verbose, false);
-    match run(cli) {
+    let result = match cli.cmd {
+        Cmd::Daemon => {
+            steward_log::init(steward_log::Level::INFO, cli.verbose, true);
+            daemon()
+        }
+        _ => {
+            steward_log::init(steward_log::Level::WARN, cli.verbose, false);
+            run(cli)
+        }
+    };
+    match result {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(e) => {
             tracing::error!("{e:#}");
@@ -326,7 +381,51 @@ fn main() -> std::process::ExitCode {
     }
 }
 
+fn daemon() -> Result<()> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(stewardd::server::run())
+}
+
+fn version() {
+    out!("steward {}", steward_proto::VERSION);
+    let running = Client::connect()
+        .ok()
+        .and_then(|mut c| c.request(&Request::Status).ok())
+        .map(|s| s["daemon"].clone());
+    match running {
+        Some(d) if d.is_object() => out!(
+            "daemon {} (pid {})",
+            d["version"].as_str().unwrap_or("?"),
+            d["pid"]
+        ),
+        Some(_) => out!("daemon: running, older than `steward version` reports"),
+        None => out!("daemon: not running"),
+    }
+}
+
 fn run(cli: Cli) -> Result<()> {
+    match cli.cmd {
+        Cmd::Service { action } => {
+            return match action {
+                ServiceCmd::Install => service::install(),
+                ServiceCmd::Uninstall => service::uninstall(),
+                ServiceCmd::Start => service::control("start"),
+                ServiceCmd::Stop => service::control("stop"),
+                ServiceCmd::Restart => service::control("restart"),
+                ServiceCmd::Status => service::control("status"),
+                ServiceCmd::Logs { follow } => service::logs(follow),
+            };
+        }
+        Cmd::Ui { args } => return service::ui(args),
+        Cmd::Version => {
+            version();
+            return Ok(());
+        }
+        Cmd::Upgrade => return service::upgrade(),
+        _ => {}
+    }
     let mut c = Backend::open(cli.db)?;
     let out = match cli.cmd {
         Cmd::Status => c.request(&Request::Status)?,
@@ -434,6 +533,10 @@ fn run(cli: Cli) -> Result<()> {
                 None => json!({}),
             };
             c.call(&method, params)?
+        }
+        // Handled before connecting.
+        Cmd::Daemon | Cmd::Service { .. } | Cmd::Ui { .. } | Cmd::Version | Cmd::Upgrade => {
+            return Ok(());
         }
     };
     out!("{}", serde_json::to_string_pretty(&out)?);

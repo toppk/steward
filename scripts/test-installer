@@ -1,0 +1,59 @@
+#!/bin/sh
+# Exercise site/install.sh against a fake release in a scratch directory:
+# fresh install, same version, upgrade, bad checksum, foreign program, no UI.
+set -eu
+
+here=$(cd "$(dirname "$0")/.." && pwd)
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT HUP INT TERM
+case "$(uname -m)" in aarch64|arm64) arch=arm64 ;; *) arch=amd64 ;; esac
+
+release() { # VERSION: stand-in binaries that report VERSION
+  rm -rf "$work/release" && mkdir -p "$work/release"
+  for name in steward steward-ui; do
+    asset="$work/release/${name}_linux_$arch"
+    printf '#!/bin/sh\necho "%s %s"\n' "$name" "$1" >"$asset"
+    (cd "$work/release" && sha256sum "${name}_linux_$arch" >"${name}_linux_$arch.sha256")
+  done
+}
+
+run() { # run the installer quietly; its output goes to $work/out
+  env STEWARD_INSTALL_DIR="$work/bin" STEWARD_RELEASE_URL="file://$work/release" \
+    PATH="$work/bin:/usr/bin:/bin" "$@" sh "$here/site/install.sh" >"$work/out" 2>&1
+}
+
+expect() { grep -q "$1" "$work/out" || { echo "FAIL: expected '$1' in:"; cat "$work/out"; exit 1; }; }
+
+release v0.1.0
+run env STEWARD_UI=1
+expect "Installed steward v0.1.0"
+expect "Installed steward-ui v0.1.0"
+[ "$("$work/bin/steward" --version)" = "steward v0.1.0" ]
+
+run env STEWARD_UI=1
+expect "Already installed: steward v0.1.0"
+
+release v0.2.0
+run env
+expect "Upgraded $work/bin/steward: steward v0.1.0 -> steward v0.2.0"
+expect "Upgraded $work/bin/steward-ui"
+
+release v0.3.0
+echo "0000000000000000000000000000000000000000000000000000000000000000  x" \
+  >"$work/release/steward_linux_$arch.sha256"
+if run env STEWARD_UI=0; then echo "FAIL: accepted a bad checksum"; exit 1; fi
+expect "checksum verification failed"
+[ "$("$work/bin/steward" --version)" = "steward v0.2.0" ]
+
+release v0.3.0
+printf '#!/bin/sh\necho "something else"\n' >"$work/bin/steward"
+if run env STEWARD_UI=0; then echo "FAIL: replaced a foreign program"; exit 1; fi
+expect "refusing to replace"
+
+rm -rf "$work/bin"
+run env STEWARD_UI=0
+expect "Installed steward v0.3.0"
+expect "Skipping steward-ui"
+[ ! -e "$work/bin/steward-ui" ]
+
+echo "installer tests passed"

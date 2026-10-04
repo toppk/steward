@@ -1,0 +1,106 @@
+# Builds and publishes a release when a vX.Y.Z tag is pushed (scripts/release
+# does that). Run it by hand with dry_run to rehearse the build without
+# publishing anything.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (for example v0.1.0)"
+        required: true
+        type: string
+      dry_run:
+        description: "Build and test only; publish nothing"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+env:
+  TAG: ${{ inputs.tag || github.ref_name }}
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build ${{ matrix.arch }}
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-22.04
+          - arch: arm64
+            runner: ubuntu-22.04-arm
+    # 22.04's glibc (2.35) is the oldest a release supports.
+    runs-on: ${{ matrix.runner }}
+    env:
+      STEWARD_VERSION: ${{ inputs.tag || github.ref_name }}
+      CARGO_PROFILE_RELEASE_STRIP: "true"
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pkg-config \
+            libxkbcommon-dev libxkbcommon-x11-dev libxcb1-dev libwayland-dev \
+            libfontconfig-dev libfreetype-dev libvulkan-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.arch }}
+
+      - name: Test
+        run: |
+          cargo test --workspace --locked
+          python3 -m unittest python/test_steward_client.py
+          sh scripts/test-installer
+
+      - name: Build
+        run: cargo build --release --locked -p steward-cli -p steward-ui
+
+      - name: Package
+        run: |
+          mkdir dist
+          cp target/release/steward "dist/steward_linux_${{ matrix.arch }}"
+          cp target/release/steward-ui "dist/steward-ui_linux_${{ matrix.arch }}"
+          test "$(dist/steward_linux_${{ matrix.arch }} --version)" = "steward $TAG"
+          test "$(dist/steward-ui_linux_${{ matrix.arch }} --version)" = "steward-ui $TAG"
+          cd dist
+          for f in *; do sha256sum "$f" > "$f.sha256"; done
+          ls -l
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist-${{ matrix.arch }}
+          path: dist/
+          if-no-files-found: error
+
+  publish:
+    name: Publish ${{ inputs.tag || github.ref_name }}
+    needs: build
+    if: ${{ !inputs.dry_run }}
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+
+      - name: Create the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$TAG" \
+            --title "steward $TAG" \
+            --notes-file "release-notes/${TAG#v}.md" \
+            dist/*

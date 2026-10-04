@@ -10,16 +10,27 @@ Documentation: <https://toppk.github.io/steward/> (sources in `site/`;
 `just docs-serve` previews it). The design notes are in
 [docs/design.md](docs/design.md).
 
+Install the latest release (Linux, x86_64 and ARM64) and start the daemon:
+
+```sh
+curl -fsSL https://toppk.github.io/steward/install.sh | sh
+steward service install
+```
+
+From source:
+
 ```sh
 just deps               # once: Fedora dev packages for the GUI
 just init-config        # writes ~/.config/steward/settings.toml (all commented out)
-just daemon -v          # run stewardd in the foreground (-v: roots and state changes, -vv: connections)
-just locate '*.torrent' # in another terminal
+just daemon -v          # run the daemon in the foreground (-v debug, -vv trace)
 just tree ~ 3           # qdirstat-style tree in the terminal, depth 3
-just ui ~               # the same tree in a GPUI window (needs `just deps` once)
+just ui ~               # the desktop app
 just cli status         # any steward subcommand
-just install            # ~/.local/bin + systemd user unit
+just install            # ~/.local/bin + `steward service install`
 ```
+
+Releases are cut from tags by `just release minor` (see `scripts/release`
+and `.github/workflows/release.yml`).
 
 Every `steward` subcommand also runs without the daemon against an index file
 with `--db PATH` (or `STEWARD_DB`), e.g.

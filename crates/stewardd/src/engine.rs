@@ -631,7 +631,7 @@ impl Engine {
         let mut wal = config.db.clone().into_os_string();
         wal.push("-wal");
         json!({
-            "version": env!("CARGO_PKG_VERSION"),
+            "version": steward_proto::VERSION,
             "pid": std::process::id(),
             "started": self.started_unix,
             "uptime_secs": self.started.elapsed().as_secs(),

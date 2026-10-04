@@ -11,7 +11,8 @@ description: Every steward command line subcommand and option.
 steward [--db PATH] [-v…] <command> [arguments]
 ```
 
-`steward` talks to the running daemon over its administration socket
+`steward` is both the daemon and its client. As a client it talks to the
+running daemon over its administration socket
 (`$XDG_RUNTIME_DIR/steward/api.socket`). Errors go to stderr as
 `steward: error: …` with exit status 1.
 
@@ -21,6 +22,30 @@ steward [--db PATH] [-v…] <command> [arguments]
 | `-v`, `-vv`, `-vvv` | Log more to stderr: info, debug, trace. Mostly useful with `--db`, where the engine runs inside the command. |
 
 Paths may be relative; `steward` makes them absolute before sending them.
+
+## Running steward
+
+`steward daemon`
+:   Run the daemon in the foreground: what the service runs. `-v` and `-vv`
+    log more.
+
+`steward service install | uninstall | start | stop | restart | status | logs [-f]`
+:   Manage the systemd user service that runs `steward daemon`. `install`
+    writes `~/.config/systemd/user/steward.service` for this `steward`,
+    enables it and (re)starts it; `uninstall` stops, disables and removes it.
+    See [Operations](operations.html#the-service).
+
+`steward upgrade`
+:   Install the latest release over this one, verified as the installer does,
+    and restart the service.
+
+`steward version`
+:   This command's version and the running daemon's (`steward --version`
+    prints just the first). Release builds report their tag, such as
+    `v0.1.0`; builds from source report `dev`.
+
+`steward ui [FOLDER]`
+:   Open the desktop app, `steward-ui`.
 
 ## Looking around
 

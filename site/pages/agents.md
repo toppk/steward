@@ -14,7 +14,7 @@ methods and shapes.
 
 ## Facts
 
-- steward is a per-user Linux service, `stewardd`, that indexes the paths
+- steward is a per-user Linux service (`steward daemon`) that indexes the paths
   under configured **roots**: `lstat` fields, directory subtree totals,
   classification tags, and content ids for some files.
 - It **only reads** the files it indexes. It never modifies, moves or
@@ -37,8 +37,9 @@ test -S "$XDG_RUNTIME_DIR/steward/content.socket" && echo running
 steward status | jq '{roots: [.configured[].path], scanning, hashing: .hashing.path}'
 ```
 
-If the socket is missing, steward isn't running. `systemctl --user status
-stewardd` says whether it is installed. Don't start or install it without
+If the socket is missing, steward isn't running. `steward service status`
+says whether it is installed as a service; `steward version` shows the
+command's and the daemon's versions. Don't start or install it without
 the user's agreement.
 
 ## Ground rules

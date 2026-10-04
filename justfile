@@ -26,7 +26,7 @@ init-config:
 
 # Run the daemon in the foreground; `just daemon -v` or `-vv` for more.
 daemon *args: build
-    {{bin}}/stewardd {{args}}
+    {{bin}}/steward daemon {{args}}
 
 # qdirstat-style GUI; needs a running daemon.
 ui path=here: build
@@ -60,20 +60,26 @@ index path db: build
 export-qdirstat path db out: build
     cd {{here}} && {{bin}}/steward --db {{db}} export-qdirstat {{path}} -o {{out}}
 
-# Install binaries to ~/.local/bin and the systemd user unit.
+# Install steward and steward-ui to ~/.local/bin and run the daemon as a
+# systemd user service (releases: see site/install.sh).
 install: build
-    install -Dm755 {{bin}}/stewardd {{bin}}/steward {{bin}}/steward-ui -t ~/.local/bin
-    install -Dm644 packaging/stewardd.service -t ~/.config/systemd/user
-    systemctl --user daemon-reload
-    @echo "enable with: systemctl --user enable --now stewardd"
+    install -Dm755 {{bin}}/steward {{bin}}/steward-ui -t ~/.local/bin
+    ~/.local/bin/steward service install
 
 uninstall:
-    -systemctl --user disable --now stewardd
-    rm -f ~/.local/bin/stewardd ~/.local/bin/steward ~/.local/bin/steward-ui ~/.config/systemd/user/stewardd.service
-    systemctl --user daemon-reload
+    -~/.local/bin/steward service uninstall
+    rm -f ~/.local/bin/steward ~/.local/bin/steward-ui
 
 logs:
-    journalctl --user -u stewardd -f
+    journalctl --user -u steward -f
+
+# Cut a release: `just release minor` (see scripts/release).
+release bump="":
+    scripts/release {{bump}}
+
+# Test site/install.sh against a fake release.
+test-installer:
+    sh scripts/test-installer
 
 # Build the documentation site into _site/ (needs pandoc).
 docs:

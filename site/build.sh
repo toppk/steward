@@ -53,6 +53,7 @@ mkdir -p "$out/theme" "$out/assets"
 cp "$theme/horizon.css" "$theme/horizon.js" "$out/theme/"
 cp -r "$here/assets/." "$out/assets/"
 cp "$here/llms.txt" "$out/llms.txt"
+cp "$here/install.sh" "$out/install.sh"
 : >"$out/llms-full.txt"
 touch "$out/.nojekyll"
 

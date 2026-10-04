@@ -1,0 +1,63 @@
+#!/bin/sh
+# Cut a release: scripts/release [patch|minor|major] (or BUMP=...), or
+# scripts/release --next BUMP to print the version it would choose.
+#
+# Versions come from tags only (vX.Y.Z); release builds compile the tag in.
+# Requires: master, a clean worktree, release-notes/X.Y.Z.md, local master
+# containing origin/master, and passing checks. Then pushes master, tags,
+# pushes the tag, and waits for the Release workflow.
+set -eu
+cd "$(dirname "$0")/.."
+
+next_only=0
+if [ "${1:-}" = "--next" ]; then next_only=1; shift; fi
+bump="${1:-${BUMP:-}}"
+
+latest=$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --merged master --sort=-v:refname | head -n 1)
+latest="${latest:-v0.0.0}"
+IFS=. read -r major minor patch <<EOT
+${latest#v}
+EOT
+
+if [ -z "$bump" ]; then
+  [ "$next_only" = 1 ] && { echo "usage: scripts/release --next patch|minor|major" >&2; exit 2; }
+  printf 'latest release: %s\nbump (patch, minor, major): ' "$latest"
+  read -r bump
+fi
+case "$bump" in
+  patch) patch=$((patch + 1)) ;;
+  minor) minor=$((minor + 1)); patch=0 ;;
+  major) major=$((major + 1)); minor=0; patch=0 ;;
+  *) echo "bump must be patch, minor or major" >&2; exit 2 ;;
+esac
+version="$major.$minor.$patch"
+tag="v$version"
+if [ "$next_only" = 1 ]; then echo "$tag"; exit 0; fi
+
+die() { echo "release: $*" >&2; exit 1; }
+[ "$(git rev-parse --abbrev-ref HEAD)" = master ] || die "not on master"
+[ -z "$(git status --porcelain --untracked-files=no)" ] || die "the worktree has uncommitted changes"
+[ -f "release-notes/$version.md" ] || die "write release-notes/$version.md first (see release-notes/TEMPLATE.md)"
+git rev-parse -q --verify "refs/tags/$tag" >/dev/null && die "$tag already exists; never reuse a version"
+git fetch -q origin master
+git merge-base --is-ancestor origin/master master || die "master does not contain origin/master; pull first"
+
+echo "checks…"
+cargo fmt --check
+cargo clippy -q --workspace --all-targets -- -D warnings
+cargo test -q --workspace
+python3 -m unittest -q python/test_steward_client.py
+sh scripts/test-installer
+
+printf 'release %s -> %s? [y/N] ' "$latest" "$tag"
+read -r answer
+[ "$answer" = y ] || die "cancelled"
+
+git push origin master
+git tag -a "$tag" -m "steward $tag"
+git push origin "$tag"
+echo "waiting for the Release workflow…"
+sleep 8
+run=$(gh run list --workflow release.yml --limit 1 --json databaseId -q '.[0].databaseId')
+gh run watch "$run" --exit-status
+gh release view "$tag"

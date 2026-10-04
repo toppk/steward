@@ -1,13 +1,13 @@
 ---
 title: API reference
 eyebrow: Reference
-lede: The protocol stewardd speaks, every method it answers, the shapes of its results, its events and its errors.
+lede: The protocol steward's daemon speaks, every method it answers, the shapes of its results, its events and its errors.
 description: steward's JSON-RPC 2.0 API — transport, sockets, every method, result types, events and errors.
 ---
 
 ## Transport
 
-stewardd listens on two Unix stream sockets in `$XDG_RUNTIME_DIR/steward/`
+The daemon listens on two Unix stream sockets in `$XDG_RUNTIME_DIR/steward/`
 (a `0700` directory; without `XDG_RUNTIME_DIR`, a private directory under
 `/tmp`):
 
@@ -260,7 +260,7 @@ bigger than one piece. Errors: `unknown_content`, `no_layer`,
 
 ### invalidate
 
-`{path}` → `"queued"`. Something under `path` changed. stewardd gathers
+`{path}` → `"queued"`. Something under `path` changed. The daemon gathers
 invalidations for two seconds, then rescans the nearest existing directory
 of each (in full).
 

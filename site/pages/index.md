@@ -93,7 +93,7 @@ files you ask for (which it will not overwrite).
 :::
 
 ::: tier
-[stewardd [scheduler · scanner · classifier · hasher]{.small}]{.box .daemon}
+[steward daemon [scheduler · scanner · classifier · hasher]{.small}]{.box .daemon}
 :::
 
 ::: tier
@@ -102,9 +102,9 @@ files you ask for (which it will not overwrite).
 :::
 :::
 
-`stewardd` runs as your user, in the background, at low CPU and I/O
-priority. The `steward` command line tool and the `steward-ui` desktop app
-are clients like any other.
+The daemon (`steward daemon`) runs as your user, as a systemd user service,
+at low CPU and I/O priority. The rest of the `steward` command and the
+`steward-ui` desktop app are clients like any other.
 
 ## Who this documentation is for
 
@@ -134,7 +134,8 @@ also available as Markdown, and [llms.txt](llms.txt) indexes them.
 ## A first look
 
 ```sh
-just install && systemctl --user enable --now stewardd   # build, install, start
+curl -fsSL https://toppk.github.io/steward/install.sh | sh   # install
+steward service install            # run the daemon now and at every login
 steward status                     # roots, scans, hashing, activity
 steward tree ~ -d 2                # where the space goes
 steward locate '*.iso'             # find by name, from the index

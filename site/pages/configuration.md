@@ -19,7 +19,7 @@ After editing the file, any of these applies it without restarting:
 
 ```sh
 steward reload                       # or:
-kill -HUP "$(pgrep -x stewardd)"
+systemctl --user reload steward      # the service maps reload to SIGHUP
 ```
 
 A reload starts scanning new roots, rescans roots whose settings changed,

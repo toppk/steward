@@ -1,15 +1,15 @@
 ---
 title: Desktop app
 eyebrow: Use
-lede: steward-ui is a window onto the daemon. It shows where your space goes, what is duplicated, how each root is configured, and what the daemon is doing right now. It never touches the disk itself. Everything it shows comes from stewardd.
+lede: steward-ui is a window onto the daemon. It shows where your space goes, what is duplicated, how each root is configured, and what the daemon is doing right now. It never touches the disk itself. Everything it shows comes from the daemon.
 description: steward-ui, the desktop app. Its tabs, its keys, and what each view shows.
 ---
 
 ## Starting it
 
 ```sh
-steward-ui            # opens your home directory
-steward-ui /home/media/TV
+steward ui            # opens your home directory (or run steward-ui directly)
+steward ui /home/media/TV
 ```
 
 The path picks the root to show first and the folder to open in it. The app

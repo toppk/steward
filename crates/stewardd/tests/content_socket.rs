@@ -245,7 +245,7 @@ fn content_socket_end_to_end() {
     assert!(activity["event_seq"].as_u64().unwrap() > 0);
     assert!(activity["reading"].is_array());
     let status = d.admin().unwrap().call("status", json!({})).unwrap();
-    assert_eq!(status["daemon"]["version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(status["daemon"]["version"], steward_proto::VERSION);
     assert!(status["daemon"]["db_bytes"].as_u64().unwrap() > 0);
     assert!(status["daemon"]["uptime_secs"].is_u64());
     let scans = status["recent_scans"].as_array().unwrap();

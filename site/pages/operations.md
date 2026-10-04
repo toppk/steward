@@ -2,53 +2,64 @@
 title: Operations
 eyebrow: Use
 lede: Running steward day to day. This covers the service, what it logs, how to see what it is doing, what it costs, and what to do when something looks wrong.
-description: Running stewardd as a service, logging, status and diagnostics, resource use and troubleshooting.
+description: Running steward's daemon as a service, logging, status and diagnostics, resource use and troubleshooting.
 ---
 
 ## The service
 
-`just install` installs a systemd user unit; enable it once:
+`steward service install` writes a systemd user unit,
+`~/.config/systemd/user/steward.service`, that runs `steward daemon` from
+wherever `steward` is installed, then enables and starts it:
 
 ```sh
-systemctl --user enable --now stewardd
-systemctl --user status stewardd
-journalctl --user -u stewardd -f        # or: just logs
+steward service install      # write, enable, (re)start
+steward service status       # systemd's view: running since, recent lines
+steward service logs -f      # the journal, following
+steward service restart      # also: start, stop
+steward service uninstall    # stop, disable, remove the unit
 ```
 
-The unit runs `stewardd` with `Nice=10` and `IOSchedulingClass=idle`, so
+The unit runs the daemon with `Nice=10` and `IOSchedulingClass=idle`, so
 scans and hashing only use the disk when nothing else wants it. It is a
 per-user service: one daemon per user, indexing what that user can read,
-answering only that user (the sockets are in a `0700` directory).
+answering only that user (the sockets are in a `0700` directory). It starts
+with your first login session; `loginctl enable-linger` keeps it running
+when you're logged out. `steward service` only ever rewrites or removes a
+unit it wrote itself.
 
-`stewardd` takes `-v` (debug) and `-vv` (trace) for more logging, see
-below. Run in a terminal, it is also the quickest way to watch a first scan:
+`steward daemon` runs the daemon in the foreground, which is the quickest
+way to watch a first scan (`-v` for debug, `-vv` for trace):
 
 ```sh
-just daemon -v
+steward daemon -v
 ```
 
-::: note
-After upgrading steward, restart the daemon
-(`systemctl --user restart stewardd`). Clients and daemon must speak the
-same protocol, and the daemon's process is what is running, not the files
-on disk.
-:::
+### Upgrading
+
+```sh
+steward upgrade
+```
+
+That installs the latest release over the current one (verifying its
+checksums, as the installer does) and restarts the service, so the daemon
+and its clients always speak the same protocol. `steward version` shows both
+versions. If you installed from source, `just install` does the same.
 
 ## Logging
 
 steward's programs log one line per event to stderr:
 
 ```
-21:44:02.118 stewardd: scan{path=/home/me kind=full}: done in 4210 ms: read 182203 dirs, …
-21:44:09.540 stewardd: warning: hash{path=/home/media/TV}: saving content ids: database snapshot is stale…; retrying (1 of 9)
-21:45:11.003 stewardd: error: hash /home/media/Movies: …
+21:44:02.118 steward: scan{path=/home/me kind=full}: done in 4210 ms: read 182203 dirs, …
+21:44:09.540 steward: warning: hash{path=/home/media/TV}: saving content ids: database snapshot is stale…; retrying (1 of 9)
+21:45:11.003 steward: error: hash /home/media/Movies: …
 ```
 
 The part in braces is the **span**: the scan, hashing job or client
 connection the line belongs to. Warnings and errors are labelled, and
 coloured on a terminal.
 
-| level | stewardd shows it | what's there |
+| level | the daemon shows it | what's there |
 |---|---|---|
 | error | always | a scan, hashing job, reload or invalidation that failed |
 | warning | always | retries, unreadable files, volumes found offline, verifications that found other bytes |
@@ -60,7 +71,7 @@ coloured on a terminal.
 `RUST_LOG=steward_index=trace` for the scanner alone.
 
 Under systemd, when stderr is the journal, each line carries its syslog
-priority, so `journalctl --user -u stewardd -p warning` shows just warnings
+priority, so `journalctl --user -u steward -p warning` shows just warnings
 and errors. Lines have no timestamp there, because the journal adds its own.
 
 The `steward` command logs only warnings and errors unless given `-v`;
@@ -88,7 +99,7 @@ watch -n2 'steward status | jq .activity'
 steward status | jq '.problems[:5]'
 ```
 
-`kill -USR2 $(pgrep -x stewardd)` writes the `activity` part to the log. That
+`systemctl --user kill -s USR2 steward` writes the `activity` part to the log. That
 helps when you are reading the journal and don't have a client handy.
 
 The desktop app's [Daemon tab](gui.html#daemon) shows all of this.
@@ -149,8 +160,8 @@ Hashing seems stuck
     how far along it is. A single large file on a slow disk can take
     minutes. Check `problems` for errors.
 
-`steward: error: connecting to stewardd at …`
-:   The daemon isn't running, or `XDG_RUNTIME_DIR` differs between the
+`steward: error: connecting to the steward daemon at …`
+:   The daemon isn't running (`steward service status`), or `XDG_RUNTIME_DIR` differs between the
     daemon and the client (common in `sudo` or `ssh` sessions).
 
 Out of inodes, or "No space left on device" with space free
