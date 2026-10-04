@@ -7000,8 +7000,10 @@ name = "steward-index"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "globset",
  "ignore",
  "rayon",
+ "regex",
  "rustix 1.1.5",
  "tempfile",
  "tokio",

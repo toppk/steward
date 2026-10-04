@@ -98,10 +98,37 @@ Paths may be relative; `steward` makes them absolute before sending them.
     time, subtree totals, tags (including inherited ones), file category and
     current content id.
 
-`steward locate PATTERN [-l LIMIT]`
-:   Paths whose final name component matches: a glob if the pattern has
-    `*`, `?` or `[` (case-sensitive), otherwise a case-insensitive
-    substring. At most `LIMIT` results (default 1000).
+`steward locate PATTERN [-x | -g | -r] [-i] [-t f|d|l|o] [--check MODE] [-l LIMIT]`
+:   Paths whose final name component matches. By default, like classic
+    `locate`: a case-insensitive substring, or a case-sensitive glob over the
+    whole name if the pattern has `*`, `?` or `[`. At most `LIMIT` results
+    (default 1000).
+
+    | option | matches |
+    |---|---|
+    | `-x`, `--exact` | the whole name, literally: `locate -x .git` |
+    | `-g`, `--glob` | the whole name as a glob: `locate -g '*.iso'` |
+    | `-r`, `--regex` | a regular expression anywhere in the name: `locate -r '^IMG_\d{4}\.CR3$'` |
+    | `-i`, `--ignore-case` | ignore case (substrings always do) |
+    | `-t`, `--type` | only files (`f`), directories (`d`), symlinks (`l`) or other (`o`) |
+
+    `--check` decides what to do about results the index has but the disk
+    doesn't (any more):
+
+    | `--check` | |
+    |---|---|
+    | `rescan` *(default)* | check each result; rescan the folder of each one that's gone (or its nearest surviving parent), then search again, so renamed files show up under their new names |
+    | `prompt` | check, then ask before rescanning (as `warn` when not run interactively) |
+    | `warn` | check, leave gone results out and say how many |
+    | `skip` | trust the index; fastest |
+
+    Notes go to stderr; the paths alone go to stdout.
+
+    ```sh
+    steward locate -x .git -t d          # every git checkout's .git directory
+    steward locate -g '*.cr3' -i         # raw photos, any case
+    steward locate -r '^v\d+\.\d+' --check skip
+    ```
 
 ## Content ids
 

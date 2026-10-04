@@ -20,6 +20,7 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from steward_client import (  # noqa: E402
+    Located,
     AsyncClient,
     Client,
     ConnectionLost,
@@ -146,6 +147,11 @@ class ClientTest(unittest.TestCase):
             self.assertEqual([o.path for o in r.online], [self.film])
             self.assertEqual(m.state, "mismatch")
             self.assertEqual(len(c.piece_layer(self.film_id)), 3 * 32)
+
+            self.assertEqual(c.locate("a.bin", mode="exact", kind="file"), [self.film])
+            found = c.locate("a.bin", mode="exact", check="exists")
+            self.assertIsInstance(found, Located)
+            self.assertEqual((found.paths, found.stale), ([self.film], []))
 
             v = c.verify(self.film_id, self.film, "test")
             self.assertEqual((v.state, v.current), ("unchanged", self.film_id))

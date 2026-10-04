@@ -265,6 +265,44 @@ fn content_socket_end_to_end() {
         "{problems:?}"
     );
 
+    // locate: exact and typed; with check, gone results are noticed, and
+    // rescan brings the index up to date with the renamed file.
+    let found = c
+        .call(
+            "locate",
+            json!({ "pattern": "b.bin", "mode": "exact", "kind": "file" }),
+        )
+        .unwrap();
+    assert_eq!(found, json!([b.to_str().unwrap()]));
+    fs::rename(&b, d.data.join("films/b2.bin")).unwrap();
+    let r = c
+        .call(
+            "locate",
+            json!({ "pattern": "^b2?\\.bin$", "mode": "regex", "check": "exists" }),
+        )
+        .unwrap();
+    assert_eq!(r["paths"], json!([]));
+    assert_eq!(r["stale"], json!([b.to_str().unwrap()]));
+    let r = c
+        .call(
+            "locate",
+            json!({ "pattern": "^b2?\\.bin$", "mode": "regex", "check": "rescan" }),
+        )
+        .unwrap();
+    assert_eq!(
+        r["paths"],
+        json!([d.data.join("films/b2.bin").to_str().unwrap()])
+    );
+    assert_eq!(r["stale"], json!([]));
+    assert_eq!(
+        r["rescanned"],
+        json!([d.data.join("films").to_str().unwrap()])
+    );
+    let e = c
+        .call("locate", json!({ "pattern": "(", "mode": "regex" }))
+        .unwrap_err();
+    assert_eq!(e.kind, "invalid_params");
+
     // A new subscriber can replay everything since the start.
     let replay = d.content().subscribe(Some(0), None).unwrap();
     assert_eq!(replay.start["complete"], true);

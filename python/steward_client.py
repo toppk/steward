@@ -57,6 +57,7 @@ __all__ = [
     "EventStream",
     "Gap",
     "Inspected",
+    "Located",
     "Observation",
     "Resolution",
     "StewardError",
@@ -204,6 +205,16 @@ class Inspected:
 
 
 @dataclass(frozen=True)
+class Located:
+    """``locate`` with a check: results that exist, indexed results that are
+    gone from disk, and folders rescanned (with ``check="rescan"``)."""
+
+    paths: list[str]
+    stale: list[str] = field(default_factory=list)
+    rescanned: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
 class Verdict:
     """What ``verify`` found at ``path``: ``unchanged`` (it holds ``id``),
     ``changed`` (it holds ``current``, or nothing hashable), ``gone``,
@@ -343,8 +354,20 @@ class _Ops:
         return _op("children", _entries, path=_abs(path))
 
     @staticmethod
-    def locate(pattern: str, limit: int) -> _Op:
-        return _op("locate", pattern=pattern, limit=limit)
+    def locate(
+        pattern: str,
+        limit: int,
+        mode: str = "auto",
+        ignore_case: bool = False,
+        kind: str | None = None,
+        check: str = "none",
+    ) -> _Op:
+        params: dict = {"pattern": pattern, "limit": limit, "mode": mode,
+                        "ignore_case": ignore_case, "check": check}
+        if kind is not None:
+            params["kind"] = kind
+        conv = _identity if check == "none" else (lambda r: _from_dict(Located, r))
+        return _op("locate", conv, **params)
 
     @staticmethod
     def classify(path: PathLike) -> _Op:
@@ -526,9 +549,21 @@ class Client:
         """Direct children, largest on disk first."""
         return self._do(_Ops.children(path))
 
-    def locate(self, pattern: str, limit: int = 1000) -> list[str]:
-        """Paths whose name contains ``pattern``, or matches it as a glob."""
-        return self._do(_Ops.locate(pattern, limit))
+    def locate(
+        self,
+        pattern: str,
+        limit: int = 1000,
+        mode: str = "auto",
+        ignore_case: bool = False,
+        kind: str | None = None,
+        check: str = "none",
+    ) -> list[str] | Located:
+        """Paths whose final name matches ``pattern``. ``mode``: ``auto``
+        (substring, or a glob if it has ``* ? [``), ``substring``, ``exact``,
+        ``glob`` or ``regex``. ``kind``: ``file``, ``dir``, ``symlink`` or
+        ``other``. With ``check`` ``exists`` or ``rescan`` the results are
+        confirmed on disk and a Located is returned instead of a list."""
+        return self._do(_Ops.locate(pattern, limit, mode, ignore_case, kind, check))
 
     def classify(self, path: PathLike) -> dict:
         return self._do(_Ops.classify(path))
@@ -883,8 +918,16 @@ class AsyncClient:
     async def children(self, path: PathLike) -> list[Entry]:
         return await self._do(_Ops.children(path))
 
-    async def locate(self, pattern: str, limit: int = 1000) -> list[str]:
-        return await self._do(_Ops.locate(pattern, limit))
+    async def locate(
+        self,
+        pattern: str,
+        limit: int = 1000,
+        mode: str = "auto",
+        ignore_case: bool = False,
+        kind: str | None = None,
+        check: str = "none",
+    ) -> list[str] | Located:
+        return await self._do(_Ops.locate(pattern, limit, mode, ignore_case, kind, check))
 
     async def classify(self, path: PathLike) -> dict:
         return await self._do(_Ops.classify(path))

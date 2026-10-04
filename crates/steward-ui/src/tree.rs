@@ -13,7 +13,7 @@ use gpui_kit::{
 use gpui_omarchy::{
     ActiveTheme as _, ButtonVariant, Theme, button, input, scrollbar, with_tooltip,
 };
-use steward_proto::{Entry, Kind, Request};
+use steward_proto::{Entry, Kind, LocateCheck, LocateMode, Request};
 
 use crate::client::{fetch, print_info, print_warning, scanning};
 use crate::format;
@@ -122,6 +122,8 @@ pub struct TreeView {
     /// The daemon is mid-scan, so directory totals may still be zero.
     scanning: bool,
     measure: Measure,
+    locate_mode: LocateMode,
+    locate_ignore_case: bool,
     polling: bool,
     _subscriptions: Vec<Subscription>,
 }
@@ -153,6 +155,8 @@ impl TreeView {
             scanning: false,
             polling: false,
             measure: Measure::Space,
+            locate_mode: LocateMode::Auto,
+            locate_ignore_case: false,
             _subscriptions: vec![sub],
         };
         this.load_root(None, cx);
@@ -451,24 +455,47 @@ impl TreeView {
             return;
         }
         self.message = Some(format!("locating {pattern}…").into());
+        let (mode, ignore_case) = (self.locate_mode, self.locate_ignore_case);
         let task = cx.background_executor().spawn({
             let pattern = pattern.clone();
-            async move { fetch(move |c| c.locate(pattern, LOCATE_LIMIT))() }
+            async move {
+                // Results are confirmed on disk; folders of gone ones rescanned.
+                fetch(move |c| {
+                    c.locate_checked(
+                        pattern,
+                        LOCATE_LIMIT,
+                        mode,
+                        ignore_case,
+                        None,
+                        LocateCheck::Rescan,
+                    )
+                })()
+            }
         });
         cx.spawn(async move |this, cx| {
             let result = task.await;
             let _ = this.update(cx, |this, cx| {
                 match result {
-                    Ok(hits) => {
-                        this.note(format!(
-                            "{} matches for {pattern}{}",
-                            format::count(hits.len() as u64),
-                            if hits.len() as u32 == LOCATE_LIMIT {
-                                " (stopped at the limit: narrow the pattern)"
-                            } else {
-                                ""
-                            }
-                        ));
+                    Ok(found) => {
+                        let hits = found.paths;
+                        let mut note =
+                            format!("{} matches for {pattern}", format::count(hits.len() as u64));
+                        if hits.len() as u32 == LOCATE_LIMIT {
+                            note.push_str(" (stopped at the limit: narrow the pattern)");
+                        }
+                        if !found.rescanned.is_empty() {
+                            note.push_str(&format!(
+                                " · rescanned {} folder(s) where results had gone",
+                                found.rescanned.len()
+                            ));
+                        }
+                        if !found.stale.is_empty() {
+                            note.push_str(&format!(
+                                " · {} gone from disk, left out",
+                                found.stale.len()
+                            ));
+                        }
+                        this.note(note);
                         this.hits = hits;
                         this.hit_selected = 0;
                         this.mode = Mode::Locate;
@@ -954,6 +981,69 @@ impl Render for TreeView {
                     .flex_1()
                     .child(input("locate", &self.locate, window, cx)),
             )
+            .children(
+                [
+                    (
+                        LocateMode::Auto,
+                        "Contains",
+                        "substring, or a glob if the pattern has * ? [",
+                    ),
+                    (LocateMode::Exact, "Exact", "the whole name, literally"),
+                    (
+                        LocateMode::Glob,
+                        "Glob",
+                        "the whole name as a glob: * ? [abc]",
+                    ),
+                    (
+                        LocateMode::Regex,
+                        "Regex",
+                        "a regular expression anywhere in the name",
+                    ),
+                ]
+                .into_iter()
+                .map(|(mode, label, tip)| {
+                    with_tooltip(
+                        button(
+                            ("locate-mode", mode as usize),
+                            label,
+                            if self.locate_mode == mode {
+                                ButtonVariant::Primary
+                            } else {
+                                ButtonVariant::Secondary
+                            },
+                            cx,
+                        )
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.locate_mode = mode;
+                            if this.mode == Mode::Locate {
+                                this.run_locate(cx);
+                            }
+                            cx.notify();
+                        })),
+                        tip,
+                    )
+                }),
+            )
+            .child(with_tooltip(
+                button(
+                    "locate-case",
+                    "Aa",
+                    if self.locate_ignore_case {
+                        ButtonVariant::Primary
+                    } else {
+                        ButtonVariant::Secondary
+                    },
+                    cx,
+                )
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.locate_ignore_case = !this.locate_ignore_case;
+                    if this.mode == Mode::Locate {
+                        this.run_locate(cx);
+                    }
+                    cx.notify();
+                })),
+                "ignore case (substrings always do)",
+            ))
             .when(self.mode == Mode::Locate, |d| {
                 d.child(
                     button("back", "Back to tree", ButtonVariant::Secondary, cx).on_click(

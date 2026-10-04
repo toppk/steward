@@ -65,10 +65,22 @@ pub enum Request {
     Children {
         path: PathBuf,
     },
+    /// Entries whose final name component matches `pattern`. With
+    /// `check`, each result is checked on disk (and with `rescan`, the
+    /// folders of stale ones are rescanned and the query run again); the
+    /// result is then `{paths, stale, rescanned}` instead of a list.
     Locate {
         pattern: String,
         #[serde(default = "default_limit")]
         limit: u32,
+        #[serde(default)]
+        mode: LocateMode,
+        #[serde(default)]
+        ignore_case: bool,
+        #[serde(default)]
+        kind: Option<Kind>,
+        #[serde(default)]
+        check: LocateCheck,
     },
     Classify {
         path: PathBuf,
@@ -153,6 +165,47 @@ pub enum Request {
 
 const fn default_limit() -> u32 {
     1000
+}
+
+/// How `locate` matches names.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LocateMode {
+    /// A glob if the pattern has `*`, `?` or `[`, else a substring.
+    #[default]
+    Auto,
+    /// Anywhere in the name, ignoring ASCII case.
+    Substring,
+    /// The whole name, literally.
+    Exact,
+    /// A glob over the whole name.
+    Glob,
+    /// A regular expression anywhere in the name (Rust `regex` syntax).
+    Regex,
+}
+
+/// Whether `locate` confirms its results on disk.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LocateCheck {
+    /// Answer from the index alone.
+    #[default]
+    None,
+    /// `lstat` each result; report the ones that are gone.
+    Exists,
+    /// As `exists`, then rescan the folders of the gone ones and ask again.
+    Rescan,
+}
+
+/// `locate`'s answer when a check was asked for.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct Located {
+    /// Results that exist on disk.
+    pub paths: Vec<String>,
+    /// Results the index had that are gone (after any rescan).
+    pub stale: Vec<String>,
+    /// Folders rescanned to bring the index up to date.
+    pub rescanned: Vec<String>,
 }
 
 /// A content id with, optionally, the size the caller expects it to have.
@@ -519,8 +572,37 @@ impl Client {
     }
 
     pub fn locate(&mut self, pattern: String, limit: u32) -> Result<Vec<String>, Error> {
-        serde_json::from_value(self.request(&Request::Locate { pattern, limit })?)
-            .map_err(Error::from)
+        serde_json::from_value(self.request(&Request::Locate {
+            pattern,
+            limit,
+            mode: LocateMode::Auto,
+            ignore_case: false,
+            kind: None,
+            check: LocateCheck::None,
+        })?)
+        .map_err(Error::from)
+    }
+
+    /// `locate` with a check (never `None`): results confirmed on disk.
+    #[allow(clippy::too_many_arguments)]
+    pub fn locate_checked(
+        &mut self,
+        pattern: String,
+        limit: u32,
+        mode: LocateMode,
+        ignore_case: bool,
+        kind: Option<Kind>,
+        check: LocateCheck,
+    ) -> Result<Located, Error> {
+        serde_json::from_value(self.request(&Request::Locate {
+            pattern,
+            limit,
+            mode,
+            ignore_case,
+            kind,
+            check,
+        })?)
+        .map_err(Error::from)
     }
 }
 

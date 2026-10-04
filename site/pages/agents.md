@@ -67,7 +67,7 @@ the user's agreement.
 |---|---|
 | to know what uses the space | `steward tree PATH -d 2` (text), or `steward raw children '{"path":"/abs/path"}'` (JSON) |
 | the size of a folder | `steward stat PATH \| jq '{total_alloc, total_size, total_files}'` |
-| to find files by name | `steward locate 'pattern'`: substring, or glob with `* ? [`; names only, not contents |
+| to find files by name | `steward locate 'pattern'`: substring, or glob with `* ? [`; `-x` exact, `-g` glob, `-r` regex, `-t d` directories only; names only, not contents. Results are confirmed on disk and stale folders rescanned (`--check rescan`, the default) |
 | the content id of a file | `steward inspect PATH \| jq -r '.[0].id'` |
 | other copies of a file | `id=$(steward inspect PATH \| jq -r '.[0].id'); steward find "$id"` |
 | where some content is now | `steward resolve ID --recheck`: check `state` and `observations[].online` |

@@ -7,8 +7,10 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 use steward_contentid::ContentId;
-use steward_index::{ChangeKind, Index, Kind, Meta, Record, ScanOptions, ScanStats};
-use steward_proto::{ContentRef, Entry, Request, ScanReport};
+use steward_index::{
+    ChangeKind, Index, Kind, KindFilter, MatchMode, Meta, Record, ScanOptions, ScanStats,
+};
+use steward_proto::{ContentRef, Entry, LocateCheck, LocateMode, Request, ScanReport};
 use tokio::sync::{Mutex, mpsc};
 use tracing::Instrument;
 
@@ -41,6 +43,15 @@ pub fn fail(kind: &'static str, message: impl Into<String>) -> anyhow::Error {
 /// The stable type of an error from `handle`.
 pub fn kind_of(e: &anyhow::Error) -> &'static str {
     e.downcast_ref::<Failure>().map_or("failed", |f| f.kind)
+}
+
+fn kind_matches(want: KindFilter, have: Kind) -> bool {
+    match want {
+        KindFilter::File => have == Kind::File,
+        KindFilter::Dir => have == Kind::Dir,
+        KindFilter::Symlink => have == Kind::Symlink,
+        KindFilter::Other => !matches!(have, Kind::File | Kind::Dir | Kind::Symlink),
+    }
 }
 
 fn content_hex(root: &[u8]) -> String {
@@ -562,13 +573,41 @@ impl Engine {
                 out.sort_by_key(|e| std::cmp::Reverse(e.total_alloc));
                 serde_json::to_value(out)?
             }
-            Request::Locate { pattern, limit } => {
-                let hits = idx.locate(&conn, &pattern, limit).await?;
-                json!(
-                    hits.iter()
-                        .map(|(_, p)| p.display().to_string())
-                        .collect::<Vec<_>>()
-                )
+            Request::Locate {
+                pattern,
+                limit,
+                mode,
+                ignore_case,
+                kind,
+                check,
+            } => {
+                let q = steward_index::NameQuery {
+                    pattern: &pattern,
+                    limit,
+                    mode: match mode {
+                        LocateMode::Auto => MatchMode::Auto,
+                        LocateMode::Substring => MatchMode::Substring,
+                        LocateMode::Exact => MatchMode::Exact,
+                        LocateMode::Glob => MatchMode::Glob,
+                        LocateMode::Regex => MatchMode::Regex,
+                    },
+                    ignore_case,
+                    kind: kind.map(|k| match k {
+                        steward_proto::Kind::File => KindFilter::File,
+                        steward_proto::Kind::Dir => KindFilter::Dir,
+                        steward_proto::Kind::Symlink => KindFilter::Symlink,
+                        steward_proto::Kind::Other => KindFilter::Other,
+                    }),
+                };
+                self.locate(&conn, &q, check).await.map_err(|e| {
+                    match e.downcast_ref::<Failure>() {
+                        Some(_) => e,
+                        None if e.to_string().starts_with("invalid ") => {
+                            fail("invalid_params", format!("{e:#}"))
+                        }
+                        None => e,
+                    }
+                })?
             }
             Request::Classify { path } => {
                 let s = self.classify(&path).await?;
@@ -699,6 +738,80 @@ impl Engine {
         report["hashing"] = json!(self.hash_progress());
         report["event_seq"] = json!(self.events.seq());
         report
+    }
+
+    /// `locate`, optionally confirming results on disk and rescanning the
+    /// folders of those that are gone ("one level up"), then asking again.
+    async fn locate(
+        &self,
+        conn: &turso::Connection,
+        q: &steward_index::NameQuery<'_>,
+        check: LocateCheck,
+    ) -> Result<Value> {
+        let find = async || -> Result<Vec<PathBuf>> {
+            Ok(self
+                .index
+                .find_names(conn, q)
+                .await?
+                .into_iter()
+                .map(|(_, p)| p)
+                .collect())
+        };
+        let mut hits = find().await?;
+        if check == LocateCheck::None {
+            return Ok(json!(
+                hits.iter()
+                    .map(|p| p.display().to_string())
+                    .collect::<Vec<_>>()
+            ));
+        }
+        let gone = |hits: &[PathBuf]| -> (Vec<PathBuf>, Vec<PathBuf>) {
+            hits.iter().cloned().partition(|p| {
+                Meta::lstat(p).is_ok_and(|m| q.kind.is_none_or(|k| kind_matches(k, m.kind)))
+            })
+        };
+        let (mut paths, mut stale) = gone(&hits);
+        let mut rescanned = Vec::new();
+        if check == LocateCheck::Rescan && !stale.is_empty() {
+            let mut dirs: Vec<PathBuf> = stale
+                .iter()
+                .filter_map(|p| p.parent())
+                .filter_map(|p| p.ancestors().find(|a| a.is_dir()))
+                .filter(|d| !self.managed || self.config().covers(d))
+                .map(Path::to_path_buf)
+                .collect();
+            dirs.sort();
+            dirs.dedup();
+            let mut kept: Vec<PathBuf> = Vec::new();
+            for d in dirs {
+                if !kept.last().is_some_and(|k| d.starts_with(k)) {
+                    kept.push(d);
+                }
+            }
+            // A burst of staleness: rescan a few folders now, queue the rest.
+            const NOW: usize = 64;
+            for d in kept.iter().skip(NOW) {
+                if let Some(tx) = &self.invalidate {
+                    let _ = tx.send(d.clone());
+                }
+            }
+            for d in kept.iter().take(NOW) {
+                if let Err(e) = self.refresh_with(d, true, true).await {
+                    tracing::warn!("locate: rescanning {}: {e:#}", d.display());
+                }
+            }
+            rescanned = kept;
+            hits = find().await?;
+            (paths, stale) = gone(&hits);
+        }
+        let show = |v: Vec<PathBuf>| -> Vec<String> {
+            v.into_iter().map(|p| p.display().to_string()).collect()
+        };
+        Ok(serde_json::to_value(steward_proto::Located {
+            paths: show(paths),
+            stale: show(stale),
+            rescanned: show(rescanned),
+        })?)
     }
 
     fn require_root(&self, path: &Path) -> Result<()> {

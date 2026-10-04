@@ -51,9 +51,13 @@ opens the Content ids tab on every path holding the same bytes.
 | <kbd>i</kbd> | rank by space or by items |
 | <kbd>/</kbd> or <kbd>Ctrl</kbd>+<kbd>F</kbd> | locate: find by name across the index |
 
-Locate takes a substring, or a glob such as `*.CR3`. Move through the results
-with the arrow keys, <kbd>Enter</kbd> to reveal one in the tree,
-<kbd>Esc</kbd> to return.
+Locate finds names across the whole index. Beside the field, choose how the
+pattern matches: **Contains** (a substring, or a glob if it has `* ? [`),
+**Exact**, **Glob** or **Regex**, and **Aa** to ignore case. Results are
+checked on disk as they come back: the folders of any that have gone are
+rescanned and the search repeated, so a file renamed since the last scan
+shows under its new name. Move through the results with the arrow keys,
+<kbd>Enter</kbd> to reveal one in the tree, <kbd>Esc</kbd> to return.
 
 ## Content ids
 

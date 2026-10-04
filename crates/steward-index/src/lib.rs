@@ -278,6 +278,68 @@ fn progress(line: impl FnOnce() -> String) {
     tracing::trace!("{}", line());
 }
 
+/// How `find_names` matches a name.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MatchMode {
+    /// A glob if the pattern has `*`, `?` or `[`, else a substring (classic
+    /// `locate`).
+    #[default]
+    Auto,
+    /// The pattern anywhere in the name, ignoring ASCII case.
+    Substring,
+    /// The whole name, literally.
+    Exact,
+    /// A glob over the whole name.
+    Glob,
+    /// A regular expression (Rust `regex` syntax) anywhere in the name.
+    Regex,
+}
+
+/// Which kinds of entries `find_names` returns.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KindFilter {
+    File,
+    Dir,
+    Symlink,
+    /// Devices, sockets, FIFOs.
+    Other,
+}
+
+#[derive(Clone, Debug)]
+pub struct NameQuery<'a> {
+    pub pattern: &'a str,
+    pub mode: MatchMode,
+    /// For exact names, globs and regular expressions (substrings always
+    /// ignore ASCII case).
+    pub ignore_case: bool,
+    pub kind: Option<KindFilter>,
+    pub limit: u32,
+}
+
+impl Default for NameQuery<'_> {
+    fn default() -> Self {
+        Self {
+            pattern: "",
+            mode: MatchMode::Auto,
+            ignore_case: false,
+            kind: None,
+            limit: 1000,
+        }
+    }
+}
+
+/// `pattern` with LIKE's wildcards made literal (`ESCAPE '\'`).
+fn like_escape(pattern: &str) -> String {
+    let mut out = String::with_capacity(pattern.len());
+    for c in pattern.chars() {
+        if matches!(c, '\\' | '%' | '_') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
 /// Resident memory of this process, for progress lines ("rss 1.2 GiB").
 pub fn rss() -> String {
     let pages = std::fs::read_to_string("/proc/self/statm")
@@ -1505,37 +1567,131 @@ impl Index {
         Ok(path)
     }
 
-    /// Entries whose name matches: a glob when `pattern` has `*` or `?`,
-    /// otherwise a case-insensitive substring.
+    /// Entries whose name matches: a glob when `pattern` has `*`, `?` or
+    /// `[`, otherwise a case-insensitive substring.
     pub async fn locate(
         &self,
         conn: &Connection,
         pattern: &str,
         limit: u32,
     ) -> Result<Vec<(i64, PathBuf)>> {
-        let (sql, pat) = if pattern.contains(['*', '?', '[']) {
-            (
-                "SELECT id FROM entries WHERE name GLOB ?1 LIMIT ?2",
-                pattern.to_string(),
-            )
-        } else {
-            (
-                "SELECT id FROM entries WHERE name LIKE ?1 LIMIT ?2",
-                format!("%{pattern}%"),
-            )
+        self.find_names(
+            conn,
+            &NameQuery {
+                pattern,
+                limit,
+                ..NameQuery::default()
+            },
+        )
+        .await
+    }
+
+    /// Entries whose final name component matches `q`, at most `q.limit`.
+    /// Exact names, substrings and case-sensitive globs are answered by
+    /// SQL; regular expressions and case-insensitive globs are matched here,
+    /// over every name.
+    pub async fn find_names(
+        &self,
+        conn: &Connection,
+        q: &NameQuery<'_>,
+    ) -> Result<Vec<(i64, PathBuf)>> {
+        let mode = match q.mode {
+            MatchMode::Auto if q.pattern.contains(['*', '?', '[']) => MatchMode::Glob,
+            MatchMode::Auto => MatchMode::Substring,
+            m => m,
         };
-        let mut rows = query(conn, sql, (pat, i64::from(limit))).await?;
-        let mut ids = Vec::new();
-        while let Some(row) = rows.next().await? {
-            ids.push(int(&row, 0)?);
-        }
-        drop(rows);
+        // Roots are stored by their whole path; locate matches names.
+        let kind = " AND parent != 0".to_string()
+            + &match q.kind {
+                None => String::new(),
+                Some(KindFilter::File) => format!(" AND kind = {}", Kind::File as i64),
+                Some(KindFilter::Dir) => format!(" AND kind = {}", Kind::Dir as i64),
+                Some(KindFilter::Symlink) => format!(" AND kind = {}", Kind::Symlink as i64),
+                Some(KindFilter::Other) => format!(
+                    " AND kind NOT IN ({}, {}, {})",
+                    Kind::File as i64,
+                    Kind::Dir as i64,
+                    Kind::Symlink as i64
+                ),
+            };
+        let limit = i64::from(q.limit);
+        let ids = match (mode, q.ignore_case) {
+            (MatchMode::Substring, _) => {
+                let sql =
+                    format!("SELECT id FROM entries WHERE name LIKE ?1 ESCAPE '\\'{kind} LIMIT ?2");
+                Self::ids(conn, &sql, (format!("%{}%", like_escape(q.pattern)), limit)).await?
+            }
+            (MatchMode::Exact, false) => {
+                let sql = format!("SELECT id FROM entries WHERE name = ?1{kind} LIMIT ?2");
+                let name = Value::Blob(q.pattern.as_bytes().to_vec());
+                Self::ids(conn, &sql, (name, limit)).await?
+            }
+            (MatchMode::Exact, true) => {
+                let sql =
+                    format!("SELECT id FROM entries WHERE name LIKE ?1 ESCAPE '\\'{kind} LIMIT ?2");
+                Self::ids(conn, &sql, (like_escape(q.pattern), limit)).await?
+            }
+            (MatchMode::Glob, false) => {
+                let sql = format!("SELECT id FROM entries WHERE name GLOB ?1{kind} LIMIT ?2");
+                Self::ids(conn, &sql, (q.pattern.to_string(), limit)).await?
+            }
+            (MatchMode::Glob, true) => {
+                let glob = globset::GlobBuilder::new(q.pattern)
+                    .case_insensitive(true)
+                    .literal_separator(true)
+                    .build()
+                    .with_context(|| format!("invalid glob {:?}", q.pattern))?
+                    .compile_matcher();
+                Self::filter_names(conn, &kind, q.limit, |n| {
+                    glob.is_match(OsStr::from_bytes(n))
+                })
+                .await?
+            }
+            (MatchMode::Regex, ic) => {
+                let re = regex::bytes::RegexBuilder::new(q.pattern)
+                    .case_insensitive(ic)
+                    .build()
+                    .with_context(|| format!("invalid regular expression {:?}", q.pattern))?;
+                Self::filter_names(conn, &kind, q.limit, |n| re.is_match(n)).await?
+            }
+            (MatchMode::Auto, _) => unreachable!("resolved above"),
+        };
         let mut cache = HashMap::new();
         let mut out = Vec::with_capacity(ids.len());
         for id in ids {
             out.push((id, self.path_of(conn, id, &mut cache).await?));
         }
         Ok(out)
+    }
+
+    async fn ids(conn: &Connection, sql: &str, params: impl turso::IntoParams) -> Result<Vec<i64>> {
+        let mut rows = query(conn, sql, params).await?;
+        let mut ids = Vec::new();
+        while let Some(row) = rows.next().await? {
+            ids.push(int(&row, 0)?);
+        }
+        Ok(ids)
+    }
+
+    /// Every name in the index through `keep`, up to `limit` matches.
+    async fn filter_names(
+        conn: &Connection,
+        kind: &str,
+        limit: u32,
+        keep: impl Fn(&[u8]) -> bool,
+    ) -> Result<Vec<i64>> {
+        let sql = format!("SELECT id, name FROM entries WHERE 1 = 1{kind}");
+        let mut rows = query(conn, &sql, ()).await?;
+        let mut ids = Vec::new();
+        while let Some(row) = rows.next().await? {
+            if keep(&blob(&row, 1)?) {
+                ids.push(int(&row, 0)?);
+                if ids.len() >= limit as usize {
+                    break;
+                }
+            }
+        }
+        Ok(ids)
     }
 
     /// Every entry under `id` (inclusive) with its path.

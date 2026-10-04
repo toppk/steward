@@ -165,9 +165,22 @@ first. Each child carries only its own tags.
 
 ### locate
 
-`{pattern, limit = 1000}` → string[] of paths whose final name component
-matches: a case-sensitive glob if `pattern` contains `*`, `?` or `[`,
-otherwise a case-insensitive substring.
+`{pattern, limit = 1000, mode = "auto", ignore_case = false, kind?, check = "none"}`
+→ string[] of paths whose final name component matches.
+
+| param | |
+|---|---|
+| `mode` | `auto` (a case-sensitive glob if `pattern` contains `*`, `?` or `[`, otherwise a substring), `substring`, `exact` (the whole name), `glob` (the whole name), `regex` (anywhere in the name; Rust `regex` syntax) |
+| `ignore_case` | for `exact`, `glob` and `regex`; substrings always ignore ASCII case |
+| `kind` | `file`, `dir`, `symlink` or `other` |
+| `check` | `none`: answer from the index. `exists`: `lstat` each result. `rescan`: also rescan the folder of each result that's gone (or its nearest existing parent; at most 64 at once, the rest queued) and search again |
+
+With `check` other than `none` the result is an object instead of a list:
+`{paths, stale, rescanned}`: the results that exist, the indexed results
+that are gone, and the folders rescanned. A malformed glob or regular
+expression is `invalid_params`. `exact`, `substring` and case-sensitive
+`glob` are answered by the index; `regex` and case-insensitive `glob` read
+every name, which takes a few seconds on a very large index.
 
 ### find_content
 

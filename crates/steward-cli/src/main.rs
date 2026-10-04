@@ -115,6 +115,26 @@ enum Cmd {
         pattern: String,
         #[arg(short, long, default_value_t = 1000)]
         limit: u32,
+        /// Match the whole name, literally.
+        #[arg(short = 'x', long, group = "mode")]
+        exact: bool,
+        /// Match the whole name as a glob: `*`, `?`, `[abc]`.
+        #[arg(short, long, group = "mode")]
+        glob: bool,
+        /// Match a regular expression anywhere in the name.
+        #[arg(short, long, group = "mode")]
+        regex: bool,
+        /// Ignore case (substring matches always do).
+        #[arg(short, long)]
+        ignore_case: bool,
+        /// Only entries of this type.
+        #[arg(short = 't', long = "type", value_enum)]
+        kind: Option<TypeArg>,
+        /// Confirm results on disk: skip (trust the index), warn about gone
+        /// ones, prompt to rescan, or rescan the folders of gone ones and ask
+        /// again.
+        #[arg(long, value_enum, default_value_t = CheckArg::Rescan)]
+        check: CheckArg,
     },
     /// Re-run classification (repositories, build output, caches…) under PATH.
     Classify { path: PathBuf },
@@ -193,6 +213,26 @@ fn human(n: u64) -> String {
 
 fn name(e: &Entry) -> &str {
     e.path.rsplit('/').next().unwrap_or(&e.path)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum TypeArg {
+    #[value(name = "f", alias = "file")]
+    File,
+    #[value(name = "d", alias = "dir")]
+    Dir,
+    #[value(name = "l", alias = "symlink")]
+    Symlink,
+    #[value(name = "o", alias = "other")]
+    Other,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum CheckArg {
+    Skip,
+    Warn,
+    Prompt,
+    Rescan,
 }
 
 /// What `tree` and `ls` rank by.
@@ -482,14 +522,83 @@ fn run(cli: Cli) -> Result<()> {
             return tree(&mut c, &me, depth, top, by, 1);
         }
         Cmd::Stat { path } => c.request(&Request::Stat { path: abs(path)? })?,
-        Cmd::Locate { pattern, limit } => {
-            for p in c
-                .request(&Request::Locate { pattern, limit })?
-                .as_array()
-                .into_iter()
-                .flatten()
+        Cmd::Locate {
+            pattern,
+            limit,
+            exact,
+            glob,
+            regex,
+            ignore_case,
+            kind,
+            check,
+        } => {
+            use steward_proto::{LocateCheck, LocateMode, Located};
+            let mode = if exact {
+                LocateMode::Exact
+            } else if glob {
+                LocateMode::Glob
+            } else if regex {
+                LocateMode::Regex
+            } else {
+                LocateMode::Auto
+            };
+            let kind = kind.map(|k| match k {
+                TypeArg::File => steward_proto::Kind::File,
+                TypeArg::Dir => steward_proto::Kind::Dir,
+                TypeArg::Symlink => steward_proto::Kind::Symlink,
+                TypeArg::Other => steward_proto::Kind::Other,
+            });
+            let mut ask = |check| {
+                c.request(&Request::Locate {
+                    pattern: pattern.clone(),
+                    limit,
+                    mode,
+                    ignore_case,
+                    kind: kind.clone(),
+                    check,
+                })
+            };
+            if check == CheckArg::Skip {
+                for p in ask(LocateCheck::None)?.as_array().into_iter().flatten() {
+                    out!("{}", p.as_str().unwrap_or_default());
+                }
+                return Ok(());
+            }
+            let first = if check == CheckArg::Rescan {
+                LocateCheck::Rescan
+            } else {
+                LocateCheck::Exists
+            };
+            let mut r: Located = serde_json::from_value(ask(first)?)?;
+            if check == CheckArg::Prompt
+                && !r.stale.is_empty()
+                && std::io::IsTerminal::is_terminal(&std::io::stdin())
             {
-                out!("{}", p.as_str().unwrap_or_default());
+                eprint!(
+                    "steward: {} results are gone from disk; rescan their folders? [Y/n] ",
+                    r.stale.len()
+                );
+                let mut answer = String::new();
+                std::io::stdin().read_line(&mut answer)?;
+                if !answer.trim().eq_ignore_ascii_case("n") {
+                    r = serde_json::from_value(ask(LocateCheck::Rescan)?)?;
+                }
+            }
+            for p in &r.paths {
+                out!("{p}");
+            }
+            if !r.rescanned.is_empty() {
+                eprintln!(
+                    "steward: rescanned {} folder(s) where results had gone",
+                    r.rescanned.len()
+                );
+            }
+            if !r.stale.is_empty() {
+                eprintln!(
+                    "steward: {} indexed result(s) no longer exist and were left out \
+                     (--check rescan updates the index)",
+                    r.stale.len()
+                );
             }
             return Ok(());
         }

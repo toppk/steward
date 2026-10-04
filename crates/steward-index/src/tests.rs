@@ -414,3 +414,70 @@ async fn an_index_without_item_counts_gains_them_on_open() {
     let index = Index::open(&tmp.path().join("db/index.db")).await.unwrap();
     assert_eq!(items(&index, &root).await, 6);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn find_names_by_mode_case_and_kind() {
+    let (_tmp, index, root) = fixture().await;
+    fs::create_dir(root.join(".git")).unwrap();
+    fs::write(root.join(".gitignore"), b"x").unwrap();
+    fs::write(root.join("a/.git"), b"gitdir: ../.git/modules/a").unwrap();
+    fs::write(root.join("my_file.DAT"), b"x").unwrap();
+    fs::write(root.join("myXfile.dat"), b"x").unwrap();
+    index.scan(&root, opts()).await.unwrap();
+    let conn = index.connect().unwrap();
+    let find = async |pattern: &str, mode, ignore_case, kind| {
+        let q = NameQuery {
+            pattern,
+            mode,
+            ignore_case,
+            kind,
+            limit: 100,
+        };
+        let mut names: Vec<String> = index
+            .find_names(&conn, &q)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(_, p)| p.strip_prefix(&root).unwrap().display().to_string())
+            .collect();
+        names.sort();
+        names
+    };
+    use MatchMode::*;
+    // Substring, as classic locate: `.gitignore` too.
+    assert_eq!(
+        find(".git", Auto, false, None).await,
+        [".git", ".gitignore", "a/.git"]
+    );
+    // `_` is literal, not a wildcard.
+    assert_eq!(find("my_f", Substring, false, None).await, ["my_file.DAT"]);
+    assert_eq!(find(".git", Exact, false, None).await, [".git", "a/.git"]);
+    assert_eq!(
+        find(".git", Exact, false, Some(KindFilter::Dir)).await,
+        [".git"]
+    );
+    assert_eq!(
+        find(".git", Exact, false, Some(KindFilter::File)).await,
+        ["a/.git"]
+    );
+    assert_eq!(
+        find("MY_FILE.dat", Exact, true, None).await,
+        ["my_file.DAT"]
+    );
+    assert!(find("MY_FILE.dat", Exact, false, None).await.is_empty());
+    assert_eq!(find("*.dat", Glob, false, None).await, ["myXfile.dat"]);
+    assert_eq!(
+        find("*.dat", Glob, true, None).await,
+        ["myXfile.dat", "my_file.DAT"]
+    );
+    assert_eq!(
+        find(r"^my.file\.", Regex, false, None).await,
+        ["myXfile.dat", "my_file.DAT"]
+    );
+    assert_eq!(
+        find(r"\.dat$", Regex, true, None).await,
+        ["myXfile.dat", "my_file.DAT"]
+    );
+    // Roots are not names.
+    assert!(find("root", Substring, false, None).await.is_empty());
+}
