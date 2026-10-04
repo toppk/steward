@@ -5,9 +5,12 @@ hero-eyebrow: Per-user file index service · Linux
 hero-title: Know your files. Every path, every copy.
 hero-lede: steward keeps one current picture of your filesystem, covering every path, how much space it takes, what kind of thing it is, and a content id that follows each file wherever it moves. It shares that picture with your applications over a local socket and never changes a byte of what it indexes.
 hero-links:
+  - label: Install
+    href: "#install"
+    kind: primary
   - label: Get started
     href: getting-started.html
-    kind: primary
+    kind: secondary
   - label: Build on steward
     href: applications.html
     kind: secondary
@@ -53,6 +56,29 @@ names bytes, not paths, so it survives renames and moves, finds duplicates
 anywhere, and matches the id other software computes for the same bytes.
 :::
 :::
+
+## Install
+
+One command, no root, Linux on x86_64 or ARM64:
+
+```sh
+curl -fsSL https://toppk.github.io/steward/install.sh | sh
+steward service install      # run the daemon now and at every login
+```
+
+The script downloads the latest release for your machine, verifies its
+SHA-256 checksums and installs `steward` (and, on desktops, `steward-ui`) into
+`~/.local/bin`. It says whether it installed, upgraded or found the same
+version already there. It never replaces a program that isn't steward, and
+doesn't touch your shell configuration. Later, `steward upgrade` does the
+same and restarts the daemon.
+
+Prefer to look first? [Read install.sh](install.sh), or download a binary
+from [GitHub Releases](https://github.com/toppk/steward/releases/latest)
+(`steward_linux_amd64` and its `.sha256`, for example), check it with
+`sha256sum -c`, make it executable and put it on your `PATH`.
+[Getting started](getting-started.html) covers configuration and building
+from source.
 
 ## What it promises
 
@@ -133,9 +159,9 @@ also available as Markdown, and [llms.txt](llms.txt) indexes them.
 
 ## A first look
 
+Once it is installed and running:
+
 ```sh
-curl -fsSL https://toppk.github.io/steward/install.sh | sh   # install
-steward service install            # run the daemon now and at every login
 steward status                     # roots, scans, hashing, activity
 steward tree ~ -d 2                # where the space goes
 steward locate '*.iso'             # find by name, from the index

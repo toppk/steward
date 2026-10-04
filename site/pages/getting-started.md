@@ -23,8 +23,23 @@ checksums, and installs:
 | `steward-ui` | the desktop app, installed where the X11/Wayland keyboard libraries are present (`STEWARD_UI=1` or `0` decides) |
 
 It only ever replaces earlier steward builds, and never an unrelated program
-of the same name. Read [the script](install.sh) first if you like. Set
-`STEWARD_INSTALL_DIR` to install somewhere else.
+of the same name. It reports whether it installed, upgraded, or found the
+same version already there, and doesn't change your shell configuration
+(it warns if `~/.local/bin` isn't on your `PATH`). Set `STEWARD_INSTALL_DIR`
+to install somewhere else.
+
+To inspect first, [read install.sh](install.sh), or download directly from
+[GitHub Releases](https://github.com/toppk/steward/releases/latest). Each
+release has `steward_linux_amd64`, `steward_linux_arm64`,
+`steward-ui_linux_amd64` and `steward-ui_linux_arm64`, each with a
+`.sha256` file:
+
+```sh
+curl -fLO https://github.com/toppk/steward/releases/latest/download/steward_linux_amd64
+curl -fLO https://github.com/toppk/steward/releases/latest/download/steward_linux_amd64.sha256
+sha256sum -c steward_linux_amd64.sha256
+install -m 755 steward_linux_amd64 ~/.local/bin/steward
+```
 
 Then run the daemon as a systemd **user** service, now and at every login:
 
