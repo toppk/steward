@@ -135,6 +135,9 @@ enum Cmd {
         /// again.
         #[arg(long, value_enum, default_value_t = CheckArg::Rescan)]
         check: CheckArg,
+        /// No timing and rescan report on stderr.
+        #[arg(short, long)]
+        quiet: bool,
     },
     /// Re-run classification (repositories, build output, caches…) under PATH.
     Classify { path: PathBuf },
@@ -233,6 +236,25 @@ enum CheckArg {
     Warn,
     Prompt,
     Rescan,
+}
+
+fn results(n: usize) -> String {
+    if n == 1 {
+        "1 result".into()
+    } else {
+        format!("{n} results")
+    }
+}
+
+/// A duration for people: `0.4 ms`, `38 ms`, `1.62 s`.
+fn took(ms: f64) -> String {
+    if ms < 10.0 {
+        format!("{ms:.1} ms")
+    } else if ms < 1000.0 {
+        format!("{ms:.0} ms")
+    } else {
+        format!("{:.2} s", ms / 1000.0)
+    }
 }
 
 /// What `tree` and `ls` rank by.
@@ -531,8 +553,15 @@ fn run(cli: Cli) -> Result<()> {
             ignore_case,
             kind,
             check,
+            quiet,
         } => {
             use steward_proto::{LocateCheck, LocateMode, Located};
+            let started = std::time::Instant::now();
+            let note = |line: String| {
+                if !quiet {
+                    eprintln!("steward: {line}");
+                }
+            };
             let mode = if exact {
                 LocateMode::Exact
             } else if glob {
@@ -559,8 +588,18 @@ fn run(cli: Cli) -> Result<()> {
                 })
             };
             if check == CheckArg::Skip {
-                for p in ask(LocateCheck::None)?.as_array().into_iter().flatten() {
+                let found = ask(LocateCheck::None)?;
+                let found = found.as_array().cloned().unwrap_or_default();
+                for p in &found {
                     out!("{}", p.as_str().unwrap_or_default());
+                }
+                note(format!(
+                    "{} in {} (from the index, not checked on disk)",
+                    results(found.len()),
+                    took(started.elapsed().as_secs_f64() * 1e3)
+                ));
+                if found.len() >= limit as usize {
+                    note(format!("stopped at {limit} results (-l raises the limit)"));
                 }
                 return Ok(());
             }
@@ -587,18 +626,46 @@ fn run(cli: Cli) -> Result<()> {
             for p in &r.paths {
                 out!("{p}");
             }
+            note(format!(
+                "{} in {}: search {}, check on disk {}{}",
+                results(r.paths.len()),
+                took(started.elapsed().as_secs_f64() * 1e3),
+                took(r.search_ms),
+                took(r.check_ms),
+                if r.rescanned.is_empty() {
+                    String::new()
+                } else {
+                    format!(", rescan {}", took(r.rescan_ms))
+                }
+            ));
             if !r.rescanned.is_empty() {
-                eprintln!(
-                    "steward: rescanned {} folder(s) where results had gone",
-                    r.rescanned.len()
-                );
+                let shown: Vec<&str> = r.rescanned.iter().take(5).map(String::as_str).collect();
+                note(format!(
+                    "rescanned {} folder(s) where indexed results had gone: {}{}",
+                    r.rescanned.len(),
+                    shown.join(", "),
+                    if r.rescanned.len() > 5 { ", …" } else { "" }
+                ));
+            }
+            if !r.queued.is_empty() {
+                note(format!(
+                    "queued {} more folder(s) for the daemon to rescan shortly",
+                    r.queued.len()
+                ));
             }
             if !r.stale.is_empty() {
-                eprintln!(
-                    "steward: {} indexed result(s) no longer exist and were left out \
-                     (--check rescan updates the index)",
-                    r.stale.len()
-                );
+                note(format!(
+                    "{} indexed result(s) no longer exist and were left out{}",
+                    r.stale.len(),
+                    if check == CheckArg::Rescan {
+                        ""
+                    } else {
+                        " (--check rescan updates the index)"
+                    }
+                ));
+            }
+            if r.limited {
+                note(format!("stopped at {limit} results (-l raises the limit)"));
             }
             return Ok(());
         }

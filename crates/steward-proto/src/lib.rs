@@ -206,6 +206,21 @@ pub struct Located {
     pub stale: Vec<String>,
     /// Folders rescanned to bring the index up to date.
     pub rescanned: Vec<String>,
+    /// Folders queued for a rescan rather than rescanned now (past 64).
+    #[serde(default)]
+    pub queued: Vec<String>,
+    /// The search stopped at `limit`: there may be more matches.
+    #[serde(default)]
+    pub limited: bool,
+    /// Milliseconds searching the index (both passes, after a rescan).
+    #[serde(default)]
+    pub search_ms: f64,
+    /// Milliseconds checking results on disk.
+    #[serde(default)]
+    pub check_ms: f64,
+    /// Milliseconds rescanning folders.
+    #[serde(default)]
+    pub rescan_ms: f64,
 }
 
 /// A content id with, optionally, the size the caller expects it to have.

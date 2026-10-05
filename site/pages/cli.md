@@ -122,7 +122,17 @@ Paths may be relative; `steward` makes them absolute before sending them.
     | `warn` | check, leave gone results out and say how many |
     | `skip` | trust the index; fastest |
 
-    Notes go to stderr; the paths alone go to stdout.
+    Results are sorted by their bytes, as `LC_ALL=C sort` would. The paths
+    alone go to stdout; a report goes to stderr: how many results, how long
+    the search, the check on disk and any rescans took, which folders were
+    rescanned or queued, and whether the limit was reached. `-q` turns the
+    report off:
+
+    ```
+    $ steward locate joystick.xml
+    /home/me/.config/game/joystick.xml
+    steward: 1 result in 1.62 s: search 1.59 s, check on disk 0.1 ms
+    ```
 
     ```sh
     steward locate -x .git -t d          # every git checkout's .git directory

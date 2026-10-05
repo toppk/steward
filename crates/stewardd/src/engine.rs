@@ -742,22 +742,30 @@ impl Engine {
 
     /// `locate`, optionally confirming results on disk and rescanning the
     /// folders of those that are gone ("one level up"), then asking again.
+    /// Results are sorted by their bytes; each phase is timed.
     async fn locate(
         &self,
         conn: &turso::Connection,
         q: &steward_index::NameQuery<'_>,
         check: LocateCheck,
     ) -> Result<Value> {
+        use std::os::unix::ffi::OsStrExt as _;
+        let ms = |t: std::time::Instant| t.elapsed().as_secs_f64() * 1e3;
         let find = async || -> Result<Vec<PathBuf>> {
-            Ok(self
+            let mut hits: Vec<PathBuf> = self
                 .index
                 .find_names(conn, q)
                 .await?
                 .into_iter()
                 .map(|(_, p)| p)
-                .collect())
+                .collect();
+            hits.sort_by(|a, b| a.as_os_str().as_bytes().cmp(b.as_os_str().as_bytes()));
+            Ok(hits)
         };
+        let t = std::time::Instant::now();
         let mut hits = find().await?;
+        let mut search_ms = ms(t);
+        let limited = hits.len() >= q.limit as usize;
         if check == LocateCheck::None {
             return Ok(json!(
                 hits.iter()
@@ -770,9 +778,13 @@ impl Engine {
                 Meta::lstat(p).is_ok_and(|m| q.kind.is_none_or(|k| kind_matches(k, m.kind)))
             })
         };
+        let t = std::time::Instant::now();
         let (mut paths, mut stale) = gone(&hits);
-        let mut rescanned = Vec::new();
+        let mut check_ms = ms(t);
+        let (mut rescanned, mut queued) = (Vec::new(), Vec::new());
+        let mut rescan_ms = 0.0;
         if check == LocateCheck::Rescan && !stale.is_empty() {
+            let t = std::time::Instant::now();
             let mut dirs: Vec<PathBuf> = stale
                 .iter()
                 .filter_map(|p| p.parent())
@@ -790,19 +802,27 @@ impl Engine {
             }
             // A burst of staleness: rescan a few folders now, queue the rest.
             const NOW: usize = 64;
-            for d in kept.iter().skip(NOW) {
+            if kept.len() > NOW {
+                queued = kept.split_off(NOW);
                 if let Some(tx) = &self.invalidate {
-                    let _ = tx.send(d.clone());
+                    for d in &queued {
+                        let _ = tx.send(d.clone());
+                    }
                 }
             }
-            for d in kept.iter().take(NOW) {
+            for d in &kept {
                 if let Err(e) = self.refresh_with(d, true, true).await {
                     tracing::warn!("locate: rescanning {}: {e:#}", d.display());
                 }
             }
             rescanned = kept;
+            rescan_ms = ms(t);
+            let t = std::time::Instant::now();
             hits = find().await?;
+            search_ms += ms(t);
+            let t = std::time::Instant::now();
             (paths, stale) = gone(&hits);
+            check_ms += ms(t);
         }
         let show = |v: Vec<PathBuf>| -> Vec<String> {
             v.into_iter().map(|p| p.display().to_string()).collect()
@@ -811,6 +831,11 @@ impl Engine {
             paths: show(paths),
             stale: show(stale),
             rescanned: show(rescanned),
+            queued: show(queued),
+            limited,
+            search_ms,
+            check_ms,
+            rescan_ms,
         })?)
     }
 

@@ -175,9 +175,12 @@ first. Each child carries only its own tags.
 | `kind` | `file`, `dir`, `symlink` or `other` |
 | `check` | `none`: answer from the index. `exists`: `lstat` each result. `rescan`: also rescan the folder of each result that's gone (or its nearest existing parent; at most 64 at once, the rest queued) and search again |
 
-With `check` other than `none` the result is an object instead of a list:
-`{paths, stale, rescanned}`: the results that exist, the indexed results
-that are gone, and the folders rescanned. A malformed glob or regular
+Results are sorted by their bytes. With `check` other than `none` the
+result is an object instead of a list: `{paths, stale, rescanned, queued,
+limited, search_ms, check_ms, rescan_ms}`: the results that exist, the
+indexed results that are gone, the folders rescanned now and those queued
+(past 64), whether the search stopped at `limit`, and the milliseconds spent
+searching, checking and rescanning. A malformed glob or regular
 expression is `invalid_params`. `exact`, `substring` and case-sensitive
 `glob` are answered by the index; `regex` and case-insensitive `glob` read
 every name, which takes a few seconds on a very large index.
