@@ -89,6 +89,15 @@ impl Activity {
         Scanning(self)
     }
 
+    /// The scan in progress: its path, kind and seconds so far.
+    pub fn current_scan(&self) -> Option<(PathBuf, &'static str, u64)> {
+        self.scan
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .map(|(p, kind, t)| (p.clone(), *kind, t.elapsed().as_secs()))
+    }
+
     pub fn readers(&self) -> Readers {
         Readers(Arc::clone(&self.reads))
     }

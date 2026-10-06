@@ -351,12 +351,29 @@ async fn serve(engine: Arc<Engine>, stream: UnixStream, admin: bool) {
                 Ok(Value::Bool(true))
             }
             Ok(req) => {
+                // `"progress": true` in params asks for progress notifications.
+                let wants = msg
+                    .params
+                    .as_ref()
+                    .and_then(|p| p.get("progress"))
+                    .and_then(Value::as_bool)
+                    == Some(true);
+                let progress: Option<crate::engine::Progress> = match (&id, wants) {
+                    (Some(rid), true) => {
+                        let (out, rid) = (out.clone(), rid.clone());
+                        Some(Arc::new(move |mut v: Value| {
+                            v["id"] = rid.clone();
+                            let _ = out.try_send(notification("progress", &v));
+                        }))
+                    }
+                    _ => None,
+                };
                 // Requests run concurrently; responses carry their ids.
                 let (engine, out) = (Arc::clone(&engine), out.clone());
                 tokio::spawn(
                     async move {
                         let t = std::time::Instant::now();
-                        let result = engine.handle(req).await.map_err(|e| {
+                        let result = engine.handle_with(req, progress).await.map_err(|e| {
                             RpcError::new(
                                 code::FAILED,
                                 crate::engine::kind_of(&e),

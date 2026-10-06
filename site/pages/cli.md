@@ -128,7 +128,17 @@ path as its raw bytes (so its output can be fed back to `stat`, `xargs -d
     | `skip` | trust the index; fastest |
 
     Results are sorted by their bytes, as `LC_ALL=C sort` would. The paths
-    alone go to stdout; a report goes to stderr: how many results, how long
+    alone go to stdout. Rescans are reported on stderr as they happen,
+    including any wait for a scan already running (such as a root's daily
+    full rescan), so a slow answer says why:
+
+    ```
+    steward: 3 of 41 results are gone from disk; rescanning 2 folder(s)
+    steward: waiting for the full scan of /home/me in progress (41 s so far) before rescanning /home/me/src
+    steward: rescanned /home/me/src in 38 ms
+    ```
+
+    When it's done, a report follows: how many results, how long
     the search, the check on disk and any rescans took, which folders were
     rescanned or queued, and whether the limit was reached. `-q` turns the
     report off:

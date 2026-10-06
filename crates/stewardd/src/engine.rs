@@ -16,6 +16,10 @@ use tracing::Instrument;
 
 use crate::config::Config;
 
+/// Receives progress reports from slow work: `{stage, message, …}`, where
+/// `message` is for people and the other fields for programs.
+pub type Progress = std::sync::Arc<dyn Fn(Value) + Send + Sync>;
+
 /// An error with a stable `data.type` for clients; any other error is
 /// reported as `failed`.
 #[derive(Debug)]
@@ -514,6 +518,11 @@ impl Engine {
     }
 
     pub async fn handle(&self, req: Request) -> Result<Value> {
+        self.handle_with(req, None).await
+    }
+
+    /// `handle`, reporting the stages of slow work to `progress`.
+    pub async fn handle_with(&self, req: Request, progress: Option<Progress>) -> Result<Value> {
         let conn = self.index.connect()?;
         let idx = &self.index;
         Ok(match req {
@@ -600,15 +609,15 @@ impl Engine {
                         steward_proto::Kind::Other => KindFilter::Other,
                     }),
                 };
-                self.locate(&conn, &q, check).await.map_err(|e| {
-                    match e.downcast_ref::<Failure>() {
+                self.locate(&conn, &q, check, progress.as_ref())
+                    .await
+                    .map_err(|e| match e.downcast_ref::<Failure>() {
                         Some(_) => e,
                         None if e.to_string().starts_with("invalid ") => {
                             fail("invalid_params", format!("{e:#}"))
                         }
                         None => e,
-                    }
-                })?
+                    })?
             }
             Request::Classify { path } => {
                 let s = self.classify(&path).await?;
@@ -744,7 +753,17 @@ impl Engine {
         conn: &turso::Connection,
         q: &steward_index::NameQuery<'_>,
         check: LocateCheck,
+        progress: Option<&Progress>,
     ) -> Result<Value> {
+        let report = |stage: &str, message: String, extra: Value| {
+            if let Some(p) = progress {
+                let mut v = json!({ "stage": stage, "message": message });
+                if let (Some(o), Value::Object(e)) = (v.as_object_mut(), extra) {
+                    o.extend(e);
+                }
+                p(v);
+            }
+        };
         use std::os::unix::ffi::OsStrExt as _;
         let ms = |t: std::time::Instant| t.elapsed().as_secs_f64() * 1e3;
         let find = async || -> Result<Vec<PathBuf>> {
@@ -804,10 +823,49 @@ impl Engine {
                     }
                 }
             }
+            report(
+                "rescanning",
+                format!(
+                    "{} of {} results are gone from disk; rescanning {} folder(s){}",
+                    stale.len(),
+                    hits.len(),
+                    kept.len(),
+                    if queued.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" now, {} more later", queued.len())
+                    }
+                ),
+                json!({ "stale": stale.len(), "folders": kept.len(), "queued": queued.len() }),
+            );
             for d in &kept {
+                let shown = wire::display(&wire::path(d));
+                if self.scan_lock.try_lock().is_err() {
+                    let (what, secs) = match self.activity.current_scan() {
+                        Some((p, kind, secs)) => (
+                            format!("the {kind} scan of {}", wire::display(&wire::path(&p))),
+                            secs,
+                        ),
+                        None => ("another scan".to_string(), 0),
+                    };
+                    report(
+                        "waiting",
+                        format!(
+                            "waiting for {what} in progress ({secs} s so far) before rescanning {shown}"
+                        ),
+                        json!({ "for": what, "secs": secs }),
+                    );
+                }
+                let started = std::time::Instant::now();
                 if let Err(e) = self.refresh_with(d, true, true).await {
                     tracing::warn!("locate: rescanning {}: {e:#}", d.display());
                 }
+                let took = ms(started);
+                report(
+                    "rescanned",
+                    format!("rescanned {shown} in {took:.0} ms"),
+                    json!({ "folder": wire::path(d), "ms": took }),
+                );
             }
             rescanned = kept;
             rescan_ms = ms(t);

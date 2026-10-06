@@ -359,6 +359,35 @@ fn names_that_are_not_utf8_travel_as_surrogate_escapes() {
 }
 
 #[test]
+fn locate_reports_rescans_as_progress_before_answering() {
+    use std::io::{BufRead, BufReader, Write};
+    let d = Daemon::start();
+    fs::rename(d.data.join("films/b.bin"), d.data.join("films/b2.bin")).unwrap();
+    let mut s =
+        std::os::unix::net::UnixStream::connect(d.run.join("steward/content.socket")).unwrap();
+    let msg = json!({ "jsonrpc": "2.0", "id": 9, "method": "locate", "params": {
+        "pattern": "b", "check": "rescan", "progress": true } });
+    s.write_all(format!("{msg}\n").as_bytes()).unwrap();
+    let mut stages = Vec::new();
+    for line in BufReader::new(s).lines() {
+        let v: Value = serde_json::from_str(&line.unwrap()).unwrap();
+        if v["method"] == "progress" {
+            assert_eq!(v["params"]["id"], 9);
+            assert!(v["params"]["message"].is_string());
+            stages.push(v["params"]["stage"].as_str().unwrap().to_string());
+            continue;
+        }
+        assert_eq!(v["id"], 9);
+        assert_eq!(
+            v["result"]["rescanned"],
+            json!([d.data.join("films").to_str().unwrap()])
+        );
+        break;
+    }
+    assert_eq!(stages, ["rescanning", "rescanned"]);
+}
+
+#[test]
 fn requests_on_one_connection_are_concurrent_and_matched_by_id() {
     use std::io::{BufRead, BufReader, Write};
     let d = Daemon::start();

@@ -32,6 +32,12 @@ terminated), in both directions.
   come back in a different order. Match them by `id`.
 - A connection that has [subscribed](#subscribe) also receives `event` and
   `gap` notifications between responses.
+- Any request may ask for **progress**: with `"progress": true` in its
+  params, slow work sends `progress` notifications before the response,
+  `{"id": <the request's id>, "stage": "…", "message": "…", …}`. `message` is
+  for people; `stage` and the other fields are for programs. Clients that
+  don't ask get none. `locate` reports `rescanning`, `waiting` (for a scan
+  already running) and `rescanned`.
 
 ## Conventions
 
@@ -207,7 +213,24 @@ first. Each child carries only its own tags.
 | `kind` | `file`, `dir`, `symlink` or `other` |
 | `check` | `none`: answer from the index. `exists`: `lstat` each result. `rescan`: also rescan the folder of each result that's gone (or its nearest existing parent; at most 64 at once, the rest queued) and search again |
 
-Results are sorted by their bytes. With `check` other than `none` the
+Results are sorted by their bytes. A rescan has to wait for any scan
+already running, such as a root's scheduled full rescan; with
+`"progress": true` the request reports that as it happens:
+
+```
+← {"jsonrpc":"2.0","method":"progress","params":{"id":7,"stage":"rescanning","message":"3 of 41 results are gone from disk; rescanning 2 folder(s)","stale":3,"folders":2,"queued":0}}
+← {"jsonrpc":"2.0","method":"progress","params":{"id":7,"stage":"waiting","message":"waiting for the full scan of /home/me in progress (41 s so far) before rescanning /home/me/src","for":"the full scan of /home/me","secs":41}}
+← {"jsonrpc":"2.0","method":"progress","params":{"id":7,"stage":"rescanned","message":"rescanned /home/me/src in 38 ms","folder":"/home/me/src","ms":38.2}}
+← {"jsonrpc":"2.0","id":7,"result":{"paths":[…], …}}
+```
+
+A client can also do the checking itself, with nothing but `content.socket`:
+`locate` without a check; `lstat` each result; pass the ones that are gone
+to [`inspect`](#inspect), which rescans each one's folder (its own listing,
+trusting the folders below) and waits; then `locate` again. That is exactly
+what `check: "rescan"` does in one request.
+
+With `check` other than `none` the
 result is an object instead of a list: `{paths, stale, rescanned, queued,
 limited, search_ms, check_ms, rescan_ms}`: the results that exist, the
 indexed results that are gone, the folders rescanned now and those queued

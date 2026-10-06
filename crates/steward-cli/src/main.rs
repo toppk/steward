@@ -395,6 +395,28 @@ impl Backend {
         }
     }
 
+    /// `request` with progress reports printed to stderr as they arrive.
+    fn request_with_progress(&mut self, req: &Request) -> Result<Value> {
+        let show = |v: &Value| {
+            if let Some(m) = v["message"].as_str() {
+                eprintln!("steward: {m}");
+            }
+        };
+        match self {
+            Self::Socket(c) => {
+                let v = serde_json::to_value(req)?;
+                let method = v["method"].as_str().unwrap_or_default().to_string();
+                let mut params = v.get("params").cloned().unwrap_or(json!({}));
+                params["progress"] = json!(true);
+                Ok(c.call_with_progress(&method, params, show)?)
+            }
+            Self::Local(rt, engine) => {
+                let progress: stewardd::engine::Progress = std::sync::Arc::new(move |v| show(&v));
+                rt.block_on(engine.handle_with(req.clone(), Some(progress)))
+            }
+        }
+    }
+
     fn request(&mut self, req: &Request) -> Result<Value> {
         let v = serde_json::to_value(req)?;
         let method = v["method"].as_str().unwrap_or_default().to_string();
@@ -610,14 +632,19 @@ fn run(cli: Cli) -> Result<()> {
                 TypeArg::Other => steward_proto::Kind::Other,
             });
             let mut ask = |check| {
-                c.request(&Request::Locate {
+                let req = Request::Locate {
                     pattern: pattern.clone(),
                     limit,
                     mode,
                     ignore_case,
                     kind: kind.clone(),
                     check,
-                })
+                };
+                if quiet {
+                    c.request(&req)
+                } else {
+                    c.request_with_progress(&req)
+                }
             };
             if check == CheckArg::Skip {
                 let found = ask(LocateCheck::None)?;

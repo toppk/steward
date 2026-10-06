@@ -537,6 +537,18 @@ impl Client {
 
     /// Call `method` with `params`; a daemon error becomes `Err`.
     pub fn call(&mut self, method: &str, params: Value) -> Result<Value, Error> {
+        self.call_with_progress(method, params, |_| {})
+    }
+
+    /// `call`, passing each `progress` notification for this request to
+    /// `on_progress` as it arrives. Ask for them with `"progress": true` in
+    /// `params`.
+    pub fn call_with_progress(
+        &mut self,
+        method: &str,
+        params: Value,
+        mut on_progress: impl FnMut(&Value),
+    ) -> Result<Value, Error> {
         use std::io::{BufRead, Write};
         let id = self.next_id;
         self.next_id += 1;
@@ -555,7 +567,11 @@ impl Client {
                 return Err(Error::transport("stewardd closed the connection"));
             }
             let msg: Value = serde_json::from_slice(&wire::incoming(buf.as_bytes()))?;
-            // Skip notifications; this client does not subscribe.
+            if msg["method"] == "progress" && msg["params"]["id"] == id {
+                on_progress(&msg["params"]);
+                continue;
+            }
+            // Skip other notifications; this client does not subscribe.
             if msg.get("id") != Some(&Value::from(id)) {
                 continue;
             }
