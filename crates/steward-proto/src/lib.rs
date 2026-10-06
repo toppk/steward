@@ -7,6 +7,8 @@
 //! - `api.socket`: administration (roots, reload, exports, maintenance);
 //! - `content.socket`: application-facing content primitives only.
 
+pub mod wire;
+
 use std::path::PathBuf;
 
 /// This build's version: the release tag (`v0.2.0`) for release builds,
@@ -51,18 +53,22 @@ pub enum Request {
     Reload,
     /// Rescan `path` (a configured root, or anything below one).
     Scan {
+        #[serde(with = "wire::serde_path")]
         path: PathBuf,
         #[serde(default)]
         trust_dir_mtime: bool,
     },
     /// An application changed something under `path`; rescan it soon.
     Invalidate {
+        #[serde(with = "wire::serde_path")]
         path: PathBuf,
     },
     Stat {
+        #[serde(with = "wire::serde_path")]
         path: PathBuf,
     },
     Children {
+        #[serde(with = "wire::serde_path")]
         path: PathBuf,
     },
     /// Entries whose final name component matches `pattern`. With
@@ -83,13 +89,16 @@ pub enum Request {
         check: LocateCheck,
     },
     Classify {
+        #[serde(with = "wire::serde_path")]
         path: PathBuf,
     },
     ContentId {
+        #[serde(with = "wire::serde_path")]
         path: PathBuf,
     },
     /// Hash every file under `path` whose content id is missing or stale.
     HashTree {
+        #[serde(with = "wire::serde_path")]
         path: PathBuf,
     },
     FindContent {
@@ -97,7 +106,9 @@ pub enum Request {
     },
     /// Write the subtree as a qdirstat 2.0 cache file at `out`.
     ExportQdirstat {
+        #[serde(with = "wire::serde_path")]
         path: PathBuf,
+        #[serde(with = "wire::serde_path")]
         out: PathBuf,
     },
     /// Settings file location, every root's policy and its index state.
@@ -109,6 +120,7 @@ pub enum Request {
     },
     /// Stop indexing a root and drop it from the index.
     RemoveRoot {
+        #[serde(with = "wire::serde_path")]
         path: PathBuf,
     },
     /// The BEP-52 piece layer of content `id` for a power-of-two
@@ -130,6 +142,7 @@ pub enum Request {
     /// now and establish the content ids of the regular files among them
     /// (directories are inspected with everything under them).
     Inspect {
+        #[serde(with = "wire::serde_paths")]
         paths: Vec<PathBuf>,
     },
     /// There is reason to believe the file at `path` no longer holds content
@@ -137,6 +150,7 @@ pub enum Request {
     /// records what it holds. `reason` is logged, not interpreted.
     Verify {
         id: String,
+        #[serde(with = "wire::serde_path")]
         path: PathBuf,
         #[serde(default)]
         reason: String,
@@ -154,9 +168,11 @@ pub enum Request {
     Unsubscribe,
     /// Content-id coverage and duplication under `path`.
     ContentSummary {
+        #[serde(with = "wire::serde_path")]
         path: PathBuf,
     },
     Duplicates {
+        #[serde(with = "wire::serde_path")]
         path: PathBuf,
         #[serde(default = "default_limit")]
         limit: u32,
@@ -530,7 +546,7 @@ impl Client {
             method: method.into(),
             params: Some(params),
         };
-        let mut line = serde_json::to_vec(&req)?;
+        let mut line = wire::out(&serde_json::to_vec(&req)?);
         line.push(b'\n');
         self.writer.write_all(&line)?;
         loop {
@@ -538,7 +554,7 @@ impl Client {
             if self.reader.read_line(&mut buf)? == 0 {
                 return Err(Error::transport("stewardd closed the connection"));
             }
-            let msg: Value = serde_json::from_str(&buf)?;
+            let msg: Value = serde_json::from_slice(&wire::incoming(buf.as_bytes()))?;
             // Skip notifications; this client does not subscribe.
             if msg.get("id") != Some(&Value::from(id)) {
                 continue;
@@ -637,7 +653,7 @@ impl Iterator for Events {
         match self.client.reader.read_line(&mut buf) {
             Ok(0) => None,
             Ok(_) => Some(
-                serde_json::from_str::<Value>(&buf)
+                serde_json::from_slice::<Value>(&wire::incoming(buf.as_bytes()))
                     .map_err(Error::from)
                     .map(|mut v| json_take(&mut v)),
             ),

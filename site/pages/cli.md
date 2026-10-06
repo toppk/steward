@@ -22,6 +22,11 @@ running daemon over its administration socket
 | `-v`, `-vv`, `-vvv` | Log more to stderr: info, debug, trace. Mostly useful with `--db`, where the engine runs inside the command. |
 
 Paths may be relative; `steward` makes them absolute before sending them.
+File names that aren't valid UTF-8 are handled exactly: `locate` prints each
+path as its raw bytes (so its output can be fed back to `stat`, `xargs -d
+'\n'` and the like), human views such as `tree` and `ls` show a stray byte as
+`\xAE`, and JSON output carries it as `\udcae`
+([details](api.html#file-names-that-arent-utf-8)).
 
 ## Running steward
 

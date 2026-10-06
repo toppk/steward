@@ -144,8 +144,8 @@ fn path_cell(id: impl Into<gpui_kit::ElementId>, path: &str, width: f32) -> impl
             .w(rems(width))
             .flex_shrink_0()
             .truncate()
-            .child(path.to_string()),
-        path.to_string(),
+            .child(steward_proto::wire::display(path)),
+        steward_proto::wire::display(path),
     )
 }
 
@@ -243,7 +243,7 @@ impl DaemonView {
                 "Scanning",
                 format!(
                     "{} ({} scan, running {})",
-                    s(scan, "path"),
+                    steward_proto::wire::display(s(scan, "path")),
                     s(scan, "kind"),
                     format::duration(f(scan, "secs"))
                 ),
@@ -286,7 +286,7 @@ impl DaemonView {
                     "Hashing",
                     format!(
                         "{}: {} of {} files, {} of {}",
-                        s(h, "path"),
+                        steward_proto::wire::display(s(h, "path")),
                         format::count(n(h, "files_done")),
                         format::count(n(h, "files_total")),
                         format::bytes(done),
@@ -586,9 +586,17 @@ impl DaemonView {
         for (i, e) in snap.events.iter().take(shown).enumerate() {
             let data = &e["data"];
             let what = match s(e, "name") {
-                "content.moved" => format!("{} → {}", s(data, "from"), s(data, "to")),
-                "content.lost" => format!("{} ({})", s(data, "path"), s(data, "reason")),
-                _ => s(data, "path").to_string(),
+                "content.moved" => format!(
+                    "{} → {}",
+                    steward_proto::wire::display(s(data, "from")),
+                    steward_proto::wire::display(s(data, "to"))
+                ),
+                "content.lost" => format!(
+                    "{} ({})",
+                    steward_proto::wire::display(s(data, "path")),
+                    s(data, "reason")
+                ),
+                _ => steward_proto::wire::display(s(data, "path")),
             };
             let id = data["id"].as_str().map(short_id).unwrap_or_default();
             c = c.child(

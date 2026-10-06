@@ -156,6 +156,20 @@ class ClientTest(unittest.TestCase):
             v = c.verify(self.film_id, self.film, "test")
             self.assertEqual((v.state, v.current), ("unchanged", self.film_id))
 
+        # A name that isn't UTF-8 round-trips: as str with a surrogate, and as bytes.
+        raw = os.path.join(os.fsencode(self.d.data), b"films", b"caf\xe9.bin")
+        with open(raw, "wb") as f:
+            f.write(data(5000, 3))
+        with Client(self.d.content, timeout=30) as c:
+            [i] = c.inspect([raw])
+            self.assertTrue(i.ok, i.error)
+            self.assertEqual(os.fsencode(i.path), raw)
+            [hit] = c.locate("caf", mode="substring")
+            self.assertEqual(os.fsencode(hit), raw)
+            self.assertEqual(c.stat(hit).size, 5000)
+            [r] = c.resolve([i.id])
+            self.assertEqual(os.fsencode(r.observations[0].path), raw)
+
         with Client(self.d.api, timeout=30) as admin:
             self.assertIn("roots", admin.settings())
 

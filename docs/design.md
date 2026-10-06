@@ -347,6 +347,18 @@ one answer to "where else is this content". Splitting per root (independent
 write locks, removal by deleting a file) stays possible because all SQL is
 in `steward-index`.
 
+## Paths on the wire
+
+Names are stored as raw bytes. On the wire every path is a JSON string, and
+a byte that isn't part of valid UTF-8 travels as the lone surrogate
+U+DC80 + byte (`\udcae`), Python's surrogateescape. Rust strings can't hold
+lone surrogates, so inside steward such a byte is the private-use character
+U+E000 plus two hex digits (a real U+E000 is doubled), and
+`steward_proto::wire` translates at exactly two places: the daemon's socket
+and the Rust client's. Paths are built into answers with `wire::path` and
+read from requests with `wire::serde_path`; nothing serializes a `PathBuf`
+directly, which would fail on such names.
+
 ## Logging
 
 stewardd, `steward` and `steward-ui` log through `tracing` (the
@@ -369,8 +381,6 @@ daemon prefixes local time.
   `/usr`); it should follow the scan's dirty set instead.
 - Per-user only. A system-wide instance would need to filter results by the
   caller's permissions (`SO_PEERCRED`).
-- Paths in JSON are converted lossily; non-UTF-8 names need a byte-safe
-  encoding on the wire.
 - The event backlog lives in memory: a daemon restart is always a gap.
 - Offline handling is tested by faking a directory's stored fsid, not with
   real mounts.

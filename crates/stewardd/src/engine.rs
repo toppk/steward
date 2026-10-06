@@ -10,7 +10,7 @@ use steward_contentid::ContentId;
 use steward_index::{
     ChangeKind, Index, Kind, KindFilter, MatchMode, Meta, Record, ScanOptions, ScanStats,
 };
-use steward_proto::{ContentRef, Entry, LocateCheck, LocateMode, Request, ScanReport};
+use steward_proto::{ContentRef, Entry, LocateCheck, LocateMode, Request, ScanReport, wire};
 use tokio::sync::{Mutex, mpsc};
 use tracing::Instrument;
 
@@ -97,7 +97,8 @@ enum Hashing {
 /// A hashing job in flight, reported by `status`.
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct HashProgress {
-    pub path: std::path::PathBuf,
+    /// The folder being hashed, as a wire path (see `steward_proto::wire`).
+    pub path: String,
     pub files_total: u64,
     pub files_done: u64,
     pub bytes_total: u64,
@@ -328,7 +329,7 @@ fn problems_report() -> Value {
 
 pub fn report(s: &ScanStats) -> ScanReport {
     ScanReport {
-        root: s.root.display().to_string(),
+        root: wire::path(&s.root),
         dirs_read: s.dirs_read,
         dirs_trusted: s.dirs_trusted,
         entries_seen: s.entries_seen,
@@ -337,7 +338,7 @@ pub fn report(s: &ScanStats) -> ScanReport {
         deleted: s.deleted,
         errors: s.errors,
         millis: s.millis,
-        offline: s.offline.iter().map(|p| p.display().to_string()).collect(),
+        offline: s.offline.iter().map(|p| wire::path(p)).collect(),
         load_ms: s.load_ms,
         write_ms: s.write_ms,
         totals_ms: s.totals_ms,
@@ -359,7 +360,7 @@ pub fn entry(r: &Record, path: &Path, tags: Vec<String>) -> Entry {
     let m = &r.meta;
     let leaf = m.kind != Kind::Dir;
     Entry {
-        path: path.display().to_string(),
+        path: wire::path(path),
         kind: kind(m.kind),
         mode: m.mode,
         uid: m.uid,
@@ -446,8 +447,8 @@ impl Engine {
                     path.display()
                 );
                 self.events
-                    .emit("storage.unindexed", json!({ "path": path }));
-                removed.push(path.display().to_string());
+                    .emit("storage.unindexed", json!({ "path": wire::path(&path) }));
+                removed.push(wire::path(&path));
             }
         }
         Ok(removed)
@@ -551,7 +552,7 @@ impl Engine {
             Request::ExportQdirstat { path, out } => {
                 let id = self.resolve(&conn, &path).await?;
                 let n = crate::qdirstat::export(idx, &conn, id, &path, &out).await?;
-                json!({ "entries": n, "out": out })
+                json!({ "entries": n, "out": wire::path(&out) })
             }
             Request::Stat { path } => {
                 let id = self.resolve(&conn, &path).await?;
@@ -624,12 +625,7 @@ impl Engine {
                 let mut cache = HashMap::new();
                 let mut out = Vec::new();
                 for eid in idx.find_content(&conn, &root).await? {
-                    out.push(
-                        idx.path_of(&conn, eid, &mut cache)
-                            .await?
-                            .display()
-                            .to_string(),
-                    );
+                    out.push(wire::path(&idx.path_of(&conn, eid, &mut cache).await?));
                 }
                 json!(out)
             }
@@ -700,7 +696,7 @@ impl Engine {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut out: Vec<_> = next
             .iter()
-            .map(|(p, t)| json!({ "path": p, "next": t }))
+            .map(|(p, t)| json!({ "path": wire::path(p), "next": t }))
             .collect();
         out.sort_by(|a, b| a["path"].as_str().cmp(&b["path"].as_str()));
         json!(out)
@@ -709,7 +705,7 @@ impl Engine {
     fn record_scan(&self, path: &Path, kind: &str, result: &Result<ScanReport>) {
         let mut entry = match result {
             Ok(r) => serde_json::to_value(r).unwrap_or_default(),
-            Err(e) => json!({ "root": path, "error": format!("{e:#}") }),
+            Err(e) => json!({ "root": wire::path(path), "error": format!("{e:#}") }),
         };
         entry["kind"] = json!(kind);
         entry["finished"] = json!(unix_now());
@@ -768,9 +764,7 @@ impl Engine {
         let limited = hits.len() >= q.limit as usize;
         if check == LocateCheck::None {
             return Ok(json!(
-                hits.iter()
-                    .map(|p| p.display().to_string())
-                    .collect::<Vec<_>>()
+                hits.iter().map(|p| wire::path(p)).collect::<Vec<_>>()
             ));
         }
         let gone = |hits: &[PathBuf]| -> (Vec<PathBuf>, Vec<PathBuf>) {
@@ -824,9 +818,7 @@ impl Engine {
             (paths, stale) = gone(&hits);
             check_ms += ms(t);
         }
-        let show = |v: Vec<PathBuf>| -> Vec<String> {
-            v.into_iter().map(|p| p.display().to_string()).collect()
-        };
+        let show = |v: Vec<PathBuf>| -> Vec<String> { v.iter().map(|p| wire::path(p)).collect() };
         Ok(serde_json::to_value(steward_proto::Located {
             paths: show(paths),
             stale: show(stale),
@@ -930,10 +922,10 @@ impl Engine {
                 obs.push((
                     offline_at.is_none(),
                     json!({
-                        "path": path,
+                            "path": wire::path(&path),
                         "inode": format!("{:x}:{}", rec.meta.dev, rec.meta.ino),
                         "online": offline_at.is_none(),
-                        "offline_at": offline_at,
+                        "offline_at": offline_at.as_deref().map(wire::path),
                         "mtime_ns": rec.meta.mtime_ns,
                     }),
                 ));
@@ -1009,7 +1001,7 @@ impl Engine {
     async fn inspect(&self, paths: Vec<PathBuf>) -> Result<Value> {
         let item_error = |path: &Path, e: &anyhow::Error| {
             json!({
-                "path": path, "kind": null, "id": null, "size": 0,
+                "path": wire::path(path), "kind": null, "id": null, "size": 0,
                 "error": { "type": kind_of(e), "message": format!("{e:#}") },
             })
         };
@@ -1072,7 +1064,8 @@ impl Engine {
             let kind = serde_json::to_value(kind(m.kind))?;
             if m.kind != Kind::File || m.size == 0 {
                 out[i] = Some(json!({
-                    "path": path, "kind": kind, "id": null, "size": m.size, "error": null,
+                    "path": wire::path(path), "kind": kind, "id": null, "size": m.size,
+                    "error": null,
                 }));
                 continue;
             }
@@ -1080,7 +1073,8 @@ impl Engine {
                 && self.has_layer(&conn, &root, m.size).await?
             {
                 out[i] = Some(json!({
-                    "path": path, "kind": kind, "id": content_hex(&root), "size": m.size,
+                    "path": wire::path(path), "kind": kind, "id": content_hex(&root),
+                    "size": m.size,
                     "error": null,
                 }));
                 continue;
@@ -1100,7 +1094,10 @@ impl Engine {
                         }
                         None => None,
                     };
-                    json!({ "path": path, "kind": kind, "id": id, "size": m.size, "error": null })
+                    json!({
+                        "path": wire::path(&path), "kind": kind, "id": id, "size": m.size,
+                        "error": null,
+                    })
                 }
                 Hashing::Changing => item_error(
                     &path,
@@ -1142,7 +1139,8 @@ impl Engine {
         let _suspect = Suspect(&self.suspect, path.to_path_buf());
         let answer = |state: &str, current: Option<String>| {
             Ok(json!({
-                "id": content_hex(&claimed), "path": path, "state": state, "current": current,
+                "id": content_hex(&claimed), "path": wire::path(path), "state": state,
+                "current": current,
             }))
         };
         let parent = path.parent().unwrap_or(path);
@@ -1231,7 +1229,7 @@ impl Engine {
     fn lost(&self, root: &[u8], path: &Path, reason: &str) {
         self.events.emit(
             "content.lost",
-            json!({ "id": content_hex(root), "path": path, "reason": reason }),
+            json!({ "id": content_hex(root), "path": wire::path(path), "reason": reason }),
         );
     }
 
@@ -1258,7 +1256,7 @@ impl Engine {
             for p in paths {
                 self.events.emit(
                     "content.observed",
-                    json!({ "id": content_hex(&h.id.root), "path": p }),
+                    json!({ "id": content_hex(&h.id.root), "path": wire::path(&p) }),
                 );
             }
         }
@@ -1319,7 +1317,11 @@ impl Engine {
                     {
                         Some(to) => self.events.emit(
                             "content.moved",
-                            json!({ "id": content_hex(&c.root), "from": c.path, "to": to }),
+                            json!({
+                                "id": content_hex(&c.root),
+                                "from": wire::path(&c.path),
+                                "to": wire::path(to),
+                            }),
                         ),
                         None => self.lost(&c.root, &c.path, "deleted"),
                     }
@@ -1332,18 +1334,20 @@ impl Engine {
             for p in paths {
                 self.events.emit(
                     "content.observed",
-                    json!({ "id": content_hex(root), "path": p }),
+                    json!({ "id": content_hex(root), "path": wire::path(p) }),
                 );
             }
         }
         for p in &stats.offline {
             if !was_offline.contains(p) {
-                self.events.emit("storage.offline", json!({ "path": p }));
+                self.events
+                    .emit("storage.offline", json!({ "path": wire::path(p) }));
             }
         }
         for p in was_offline {
             if !stats.offline.contains(p) {
-                self.events.emit("storage.online", json!({ "path": p }));
+                self.events
+                    .emit("storage.online", json!({ "path": wire::path(p) }));
             }
         }
     }
@@ -1429,7 +1433,7 @@ impl Engine {
         }
         let dups: Vec<_> = ids.values().filter(|(n, _)| *n > 1).collect();
         Ok(json!({
-            "path": path,
+            "path": wire::path(path),
             "files": files,
             "bytes": bytes,
             "hashed_files": hashed,
@@ -1741,7 +1745,7 @@ impl Engine {
         let started = std::time::Instant::now();
         let started_unix = unix_now();
         self.set_hash_progress(Some(HashProgress {
-            path: path.to_path_buf(),
+            path: wire::path(path),
             files_total,
             bytes_total,
             files_done: 0,
@@ -1820,14 +1824,14 @@ impl Engine {
                 for (p, root) in seen {
                     self.events.emit(
                         "content.observed",
-                        json!({ "id": content_hex(&root), "path": p }),
+                        json!({ "id": content_hex(&root), "path": wire::path(&p) }),
                     );
                 }
                 tracing::trace!("saved {n} content ids ({hashed} so far)");
                 last_flush = std::time::Instant::now();
             }
             self.set_hash_progress(Some(HashProgress {
-                path: path.to_path_buf(),
+                path: wire::path(path),
                 files_total,
                 bytes_total,
                 files_done,
@@ -1911,7 +1915,8 @@ impl Engine {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()?;
-        p.bytes_done = (p.bytes_done + self.activity.read_under(&p.path)).min(p.bytes_total);
+        p.bytes_done =
+            (p.bytes_done + self.activity.read_under(&wire::to_path(&p.path))).min(p.bytes_total);
         Some(p)
     }
 
@@ -1928,7 +1933,7 @@ impl Engine {
             for id in self.index.find_content(&conn, &root).await? {
                 let p = self.index.path_of(&conn, id, &mut cache).await?;
                 if p.starts_with(path) {
-                    paths.push(p.display().to_string());
+                    paths.push(wire::path(&p));
                 }
             }
             if paths.len() > 1 {

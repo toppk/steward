@@ -362,9 +362,10 @@ impl Render for Shell {
                     .items_center()
                     .gap(rems(0.75))
                     .when_some(self.hashing.clone(), |d, (path, pct)| {
-                        let name = Path::new(&path)
+                        let shown = steward_proto::wire::display(&path);
+                        let name = Path::new(&shown)
                             .file_name()
-                            .map_or(path.clone(), |n| n.to_string_lossy().into_owned());
+                            .map_or(shown.clone(), |n| n.to_string_lossy().into_owned());
                         d.child(with_tooltip(
                             div()
                                 .id("hashing")
@@ -377,7 +378,7 @@ impl Render for Shell {
                                     gpui_omarchy::Status::Neutral,
                                     cx,
                                 )),
-                            format!("computing content ids under {path}\nclick for details"),
+                            format!("computing content ids under {shown}\nclick for details"),
                         ))
                     })
                     .when(self.scanning, |d| {

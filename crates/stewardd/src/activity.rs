@@ -111,7 +111,11 @@ impl Activity {
             .unwrap_or_else(PoisonError::into_inner)
             .as_ref()
             .map(|(path, kind, t)| {
-                json!({ "path": path, "kind": kind, "secs": t.elapsed().as_secs() })
+                json!({
+                    "path": steward_proto::wire::path(path),
+                    "kind": kind,
+                    "secs": t.elapsed().as_secs(),
+                })
             });
         let mut reads: Vec<_> = self
             .reads
@@ -133,7 +137,12 @@ impl Activity {
             "reading": reads
                 .into_iter()
                 .map(|(secs, path, size, read)| {
-                    json!({ "path": path, "size": size, "read": read, "secs": secs })
+                    json!({
+                        "path": steward_proto::wire::path(&path),
+                        "size": size,
+                        "read": read,
+                        "secs": secs,
+                    })
                 })
                 .collect::<Vec<_>>(),
             "connections": self.connections.load(Ordering::Relaxed),

@@ -244,8 +244,11 @@ fn path_row(
             .on_click(cx.listener(move |_, _: &ClickEvent, _, cx| {
                 cx.emit(ContentEvent::Reveal(target.clone()));
             }))
-            .child(path.clone()),
-        format!("{path}\nclick to show in the tree"),
+            .child(steward_proto::wire::display(&path)),
+        format!(
+            "{}\nclick to show in the tree",
+            steward_proto::wire::display(&path)
+        ),
     )
 }
 

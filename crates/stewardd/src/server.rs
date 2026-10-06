@@ -150,8 +150,9 @@ fn application_method(req: &Request) -> bool {
     )
 }
 
+/// One message, with non-UTF-8 path bytes as `\udcXX` (see `wire`).
 fn line(msg: &impl serde::Serialize) -> Vec<u8> {
-    let mut out = serde_json::to_vec(msg).unwrap_or_default();
+    let mut out = steward_proto::wire::out(&serde_json::to_vec(msg).unwrap_or_default());
     out.push(b'\n');
     out
 }
@@ -284,7 +285,9 @@ async fn serve(engine: Arc<Engine>, stream: UnixStream, admin: bool) {
     let mut events: Option<tokio::task::JoinHandle<()>> = None;
     let mut lines = BufReader::new(read).lines();
     while let Ok(Some(text)) = lines.next_line().await {
-        let msg: RpcRequest = match serde_json::from_str::<Value>(&text) {
+        let msg: RpcRequest = match serde_json::from_slice::<Value>(&steward_proto::wire::incoming(
+            text.as_bytes(),
+        )) {
             Err(e) => {
                 let e = RpcError::new(code::PARSE, "parse_error", e.to_string());
                 let _ = out.send(reply(Value::Null, Err(e))).await;

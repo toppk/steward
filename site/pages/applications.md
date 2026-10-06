@@ -50,6 +50,22 @@ def steward():
         return None
 ```
 
+## Paths are bytes
+
+File names on Linux are bytes and need not be UTF-8. steward never mangles
+them: such bytes travel as `\udcXX` escapes
+([details](api.html#file-names-that-arent-utf-8)), which Python decodes
+natively. Treat every path you get as an opaque value to hand to the
+filesystem (or back to steward), and only make it printable at the moment
+you show it:
+
+```python
+p = c.locate("Deluxe")[0]               # str, possibly with lone surrogates
+open(p, "rb")                           # works
+raw = os.fsencode(p)                    # the exact bytes on disk
+print(p.encode("utf-8", "backslashreplace").decode())   # safe to print
+```
+
 ## Ask about paths
 
 ```python

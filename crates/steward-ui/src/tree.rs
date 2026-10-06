@@ -13,7 +13,7 @@ use gpui_kit::{
 use gpui_omarchy::{
     ActiveTheme as _, ButtonVariant, Theme, button, input, scrollbar, with_tooltip,
 };
-use steward_proto::{Entry, Kind, LocateCheck, LocateMode, Request};
+use steward_proto::{Entry, Kind, LocateCheck, LocateMode, Request, wire};
 
 use crate::client::{fetch, print_info, print_warning, scanning};
 use crate::format;
@@ -265,7 +265,7 @@ impl TreeView {
             return;
         }
         self.rows[ix].loading = true;
-        let p = PathBuf::from(&path);
+        let p = wire::to_path(&path);
         let task = cx
             .background_executor()
             .spawn(async move { fetch(move |c| c.children(p))() });
@@ -406,15 +406,15 @@ impl TreeView {
         let Some(row) = self.rows.get(self.selected) else {
             return;
         };
-        let target = if row.is_dir() {
-            row.entry.path.clone()
+        let path = if row.is_dir() {
+            wire::to_path(&row.entry.path)
         } else {
-            Path::new(&row.entry.path)
+            wire::to_path(&row.entry.path)
                 .parent()
-                .map_or_else(String::new, |p| p.display().to_string())
+                .map_or_else(PathBuf::new, Path::to_path_buf)
         };
+        let target = wire::display(&wire::path(&path));
         self.message = Some(format!("rescanning {target}…").into());
-        let path = PathBuf::from(&target);
         let task = cx.background_executor().spawn(async move {
             fetch(move |c| {
                 c.request(&Request::Scan {
@@ -516,7 +516,7 @@ impl TreeView {
 
     /// Open `path`'s directory and select it.
     pub fn reveal_path(&mut self, path: &str, cx: &mut Context<'_, Self>) {
-        let parent = Path::new(path)
+        let parent = wire::to_path(path)
             .parent()
             .map_or_else(|| PathBuf::from("/"), Path::to_path_buf);
         self.enter(parent, Some(path.to_string()), cx);
@@ -526,7 +526,7 @@ impl TreeView {
         let Some(hit) = self.hits.get(ix).cloned() else {
             return;
         };
-        let parent = Path::new(&hit)
+        let parent = wire::to_path(&hit)
             .parent()
             .map_or_else(|| PathBuf::from("/"), Path::to_path_buf);
         self.enter(parent, Some(hit), cx);
@@ -581,12 +581,12 @@ impl TreeView {
             "enter" | "space" => self.toggle(sel, cx),
             "g" => {
                 if let Some(r) = self.rows.get(sel).filter(|r| r.is_dir()) {
-                    self.enter(PathBuf::from(&r.entry.path), None, cx);
+                    self.enter(wire::to_path(&r.entry.path), None, cx);
                 }
             }
             "backspace" | "u" => {
                 if let Some(up) = self.root.parent().map(Path::to_path_buf) {
-                    let here = self.root.display().to_string();
+                    let here = wire::path(&self.root);
                     self.enter(up, Some(here), cx);
                 }
             }
@@ -725,8 +725,8 @@ fn tree_row(
                         .min_w_0()
                         .truncate()
                         .text_color(name_color)
-                        .child(row.name().to_string()),
-                    row.name().to_string(),
+                        .child(wire::display(row.name())),
+                    wire::display(row.name()),
                 )),
         )
         .child(
@@ -810,7 +810,7 @@ fn status_line(row: Option<&Row>, theme: &Theme, cx: &mut Context<'_, TreeView>)
         div()
             .text_color(theme.bright)
             .overflow_hidden()
-            .child(e.path.clone()),
+            .child(wire::display(&e.path)),
     )
     .child(format::mode(k, e.mode))
     .child(format!("{}:{}", format::user(e.uid), e.gid))
@@ -887,8 +887,8 @@ impl Render for TreeView {
                                         .id(("hit", ix))
                                         .min_w_0()
                                         .truncate()
-                                        .child(this.hits[ix].clone()),
-                                    this.hits[ix].clone(),
+                                        .child(wire::display(&this.hits[ix])),
+                                    wire::display(&this.hits[ix]),
                                 ))
                                 .into_any_element()
                         })
@@ -932,7 +932,7 @@ impl Render for TreeView {
                 button("up", "Up", ButtonVariant::Secondary, cx).on_click(cx.listener(
                     move |this, _, _, cx| {
                         if let Some(p) = up_root.parent() {
-                            this.enter(p.to_path_buf(), Some(up_root.display().to_string()), cx);
+                            this.enter(p.to_path_buf(), Some(wire::path(&up_root)), cx);
                         }
                     },
                 )),

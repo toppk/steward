@@ -214,8 +214,40 @@ fn human(n: u64) -> String {
     }
 }
 
-fn name(e: &Entry) -> &str {
-    e.path.rsplit('/').next().unwrap_or(&e.path)
+/// The entry's final name, for people: bytes that aren't UTF-8 as `\xAE`.
+fn name(e: &Entry) -> String {
+    steward_proto::wire::display(e.path.rsplit('/').next().unwrap_or(&e.path))
+}
+
+/// A wire path on its own line, as the exact bytes it names, for scripts.
+fn print_path(p: &str) {
+    use std::io::Write as _;
+    let mut line = steward_proto::wire::decode(p);
+    line.push(b'\n');
+    if std::io::stdout().write_all(&line).is_err() {
+        std::process::exit(0);
+    }
+}
+
+/// One JSON value per line (events), non-UTF-8 path bytes as `\udcXX`.
+fn print_json_line(v: &Value) {
+    use std::io::Write as _;
+    let mut text = steward_proto::wire::out(&serde_json::to_vec(v).unwrap_or_default());
+    text.push(b'\n');
+    if std::io::stdout().write_all(&text).is_err() {
+        std::process::exit(0);
+    }
+}
+
+/// JSON for scripts and jq: non-UTF-8 path bytes as `\udcXX` escapes.
+fn print_json(v: &Value) -> Result<()> {
+    use std::io::Write as _;
+    let mut text = steward_proto::wire::out(serde_json::to_string_pretty(v)?.as_bytes());
+    text.push(b'\n');
+    if std::io::stdout().write_all(&text).is_err() {
+        std::process::exit(0);
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
@@ -380,7 +412,7 @@ fn tree(c: &mut Backend, e: &Entry, depth: u32, top: usize, by: By, indent: usiz
     if depth == 0 || !matches!(e.kind, steward_proto::Kind::Dir) {
         return Ok(());
     }
-    let mut kids = c.children(PathBuf::from(&e.path))?;
+    let mut kids = c.children(steward_proto::wire::to_path(&e.path))?;
     kids.sort_by_key(|k| std::cmp::Reverse(by.of(k)));
     let rest = kids.len().saturating_sub(top);
     for k in kids.iter().take(top) {
@@ -591,7 +623,7 @@ fn run(cli: Cli) -> Result<()> {
                 let found = ask(LocateCheck::None)?;
                 let found = found.as_array().cloned().unwrap_or_default();
                 for p in &found {
-                    out!("{}", p.as_str().unwrap_or_default());
+                    print_path(p.as_str().unwrap_or_default());
                 }
                 note(format!(
                     "{} in {} (from the index, not checked on disk)",
@@ -624,7 +656,7 @@ fn run(cli: Cli) -> Result<()> {
                 }
             }
             for p in &r.paths {
-                out!("{p}");
+                print_path(p);
             }
             note(format!(
                 "{} in {}: search {}, check on disk {}{}",
@@ -639,7 +671,12 @@ fn run(cli: Cli) -> Result<()> {
                 }
             ));
             if !r.rescanned.is_empty() {
-                let shown: Vec<&str> = r.rescanned.iter().take(5).map(String::as_str).collect();
+                let shown: Vec<String> = r
+                    .rescanned
+                    .iter()
+                    .take(5)
+                    .map(|d| steward_proto::wire::display(d))
+                    .collect();
                 note(format!(
                     "rescanned {} folder(s) where indexed results had gone: {}{}",
                     r.rescanned.len(),
@@ -699,7 +736,7 @@ fn run(cli: Cli) -> Result<()> {
             let mut stream = client.subscribe(since, ids)?;
             eprintln!("{}", stream.start);
             for msg in &mut stream {
-                out!("{}", msg?);
+                print_json_line(&msg?);
             }
             return Ok(());
         }
@@ -715,6 +752,6 @@ fn run(cli: Cli) -> Result<()> {
             return Ok(());
         }
     };
-    out!("{}", serde_json::to_string_pretty(&out)?);
+    print_json(&out)?;
     Ok(())
 }

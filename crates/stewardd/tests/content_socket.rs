@@ -2,6 +2,7 @@
 //! capability split, resolve, inspect, verify and content events.
 
 use std::fs;
+use std::os::unix::ffi::OsStringExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
@@ -313,6 +314,48 @@ fn content_socket_end_to_end() {
     // A seq the daemon never reached is a gap.
     let ahead = d.content().subscribe(Some(1_000_000), None).unwrap();
     assert_eq!(ahead.start["complete"], false);
+}
+
+#[test]
+fn names_that_are_not_utf8_travel_as_surrogate_escapes() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::ffi::OsStrExt as _;
+    let d = Daemon::start();
+    let mut raw = d.data.join("films").into_os_string().into_vec();
+    raw.extend_from_slice(b"/caf\xe9.bin");
+    let path = PathBuf::from(std::ffi::OsString::from_vec(raw.clone()));
+    fs::write(&path, bytes(5000, 3)).unwrap();
+    let wire_name = format!("{}/caf\\udce9.bin", d.data.join("films").display());
+
+    let s = std::os::unix::net::UnixStream::connect(d.run.join("steward/content.socket")).unwrap();
+    let mut w = s.try_clone().unwrap();
+    let mut lines = BufReader::new(s).lines();
+    let mut ask = |method: &str, params: &str| -> String {
+        writeln!(
+            w,
+            r#"{{"jsonrpc":"2.0","id":1,"method":"{method}","params":{params}}}"#
+        )
+        .unwrap();
+        lines.next().unwrap().unwrap()
+    };
+    // In: a path sent as Python's json.dumps would. Out: the same escape.
+    let reply = ask("inspect", &format!(r#"{{"paths":["{wire_name}"]}}"#));
+    assert!(reply.contains(r"caf\udce9.bin"), "{reply}");
+    assert!(reply.contains(r#""error":null"#), "{reply}");
+    let reply = ask("locate", r#"{"pattern":"caf","mode":"substring"}"#);
+    assert!(reply.contains(r"caf\udce9.bin"), "{reply}");
+    let reply = ask("stat", &format!(r#"{{"path":"{wire_name}"}}"#));
+    assert!(reply.contains(r#""size":5000"#), "{reply}");
+
+    // The Rust client gets the bytes back exactly.
+    let mut c = d.content();
+    let hits = c.locate("caf".into(), 10).unwrap();
+    assert_eq!(steward_proto::wire::decode(&hits[0]), raw);
+    let e = c.stat(path.clone()).unwrap();
+    assert_eq!(
+        steward_proto::wire::to_path(&e.path).as_os_str().as_bytes(),
+        raw
+    );
 }
 
 #[test]

@@ -32,6 +32,10 @@ stewardd speaks JSON-RPC 2.0, one message per line, on two Unix sockets in
 
     asyncio.run(main())
 
+Paths that aren't valid UTF-8 arrive as str with lone surrogates
+(``os.fsdecode`` style); ``os.fsencode(path)`` returns their exact bytes, and
+paths can be passed in as str or bytes.
+
 Standard library only; Python 3.9+.
 """
 
@@ -66,7 +70,11 @@ __all__ = [
     "content_socket_path",
 ]
 
-PathLike = Union[str, "os.PathLike[str]"]
+# Paths may be str or bytes. Linux names are bytes; steward sends names that
+# aren't valid UTF-8 with each stray byte as a lone surrogate (\udc80-\udcff),
+# Python's own "surrogateescape" convention: os.fsencode(path) gives the exact
+# bytes back, and open(path) works directly.
+PathLike = Union[str, bytes, "os.PathLike[str]", "os.PathLike[bytes]"]
 ContentRef = Union[str, "tuple[str, Optional[int]]"]
 
 # Directory listings of large trees are multi-megabyte single lines.
@@ -270,7 +278,7 @@ def api_socket_path() -> str:
 
 
 def _abs(path: PathLike) -> str:
-    return os.path.abspath(os.path.expanduser(os.fspath(path)))
+    return os.path.abspath(os.path.expanduser(os.fsdecode(os.fspath(path))))
 
 
 def _identity(x: Any) -> Any:

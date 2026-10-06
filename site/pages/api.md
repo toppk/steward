@@ -36,8 +36,9 @@ terminated), in both directions.
 ## Conventions
 
 Paths
-:   Absolute, without `~`. Answers carry absolute paths. Non-UTF-8 names are
-    converted lossily.
+:   Absolute, without `~`, in requests and answers alike. Every path is a JSON
+    string, including names that aren't valid UTF-8; see
+    [File names that aren't UTF-8](#file-names-that-arent-utf-8).
 
 Content ids
 :   `btv2:` followed by 64 lowercase hex digits, the file's BEP 52
@@ -51,6 +52,37 @@ Times
 :   `Entry.mtime` is in seconds since the Unix epoch. Fields ending in `_ns`
     are nanoseconds. Event `time`, `started`, `finished` and the like are
     seconds as floating point.
+
+## File names that aren't UTF-8
+
+Linux file names are bytes, and some aren't valid UTF-8: a Latin-1 `®`
+(`0xAE`) from an old Windows share, a file made on purpose by a test. JSON
+strings are Unicode. steward sends every path as a JSON string anyway, and
+keeps the exact bytes, using the same convention as Python's file APIs
+("surrogateescape", PEP 383):
+
+- valid UTF-8 travels as itself (all but a handful of names, on any real
+  system);
+- each byte that isn't part of valid UTF-8 travels as the lone surrogate
+  U+DC80 + byte, written in JSON as an escape: `0xAE` is `\udcae`.
+
+```
+on disk:  /home/me/Shorts/Arch Deluxe\xae.doc
+on wire:  "/home/me/Shorts/Arch Deluxe\udcae.doc"
+```
+
+The same rule applies to paths you send: `{"path": "/home/me/Shorts/Arch
+Deluxe\udcae.doc"}` names that file. Every path field in every request,
+answer and event follows it.
+
+In Python it needs no work: `json.loads` turns `\udcae` into a lone surrogate
+in a `str`, `open(path)` and `os.stat(path)` use it directly, and
+`os.fsencode(path)` returns the exact bytes. The bundled client accepts paths
+as `str` or `bytes`. In JavaScript, `JSON.parse` keeps lone surrogates in
+strings too. Elsewhere, decode `\udc80`–`\udcff` escapes to the bytes
+`0x80`–`0xff` yourself; a JSON parser that rejects lone surrogates, or
+replaces them (as `jq` does, printing `�`), loses the original bytes. Never
+assume a path is printable.
 
 ## Errors
 
