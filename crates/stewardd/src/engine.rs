@@ -49,6 +49,19 @@ pub fn kind_of(e: &anyhow::Error) -> &'static str {
     e.downcast_ref::<Failure>().map_or("failed", |f| f.kind)
 }
 
+/// The deepest folder containing all of `dirs`.
+fn common_ancestor(dirs: &[PathBuf]) -> PathBuf {
+    let mut common = dirs.first().cloned().unwrap_or_default();
+    for d in dirs.iter().skip(1) {
+        while !d.starts_with(&common) {
+            if !common.pop() {
+                break;
+            }
+        }
+    }
+    common
+}
+
 fn kind_matches(want: KindFilter, have: Kind) -> bool {
     match want {
         KindFilter::File => have == Kind::File,
@@ -838,35 +851,29 @@ impl Engine {
                 ),
                 json!({ "stale": stale.len(), "folders": kept.len(), "queued": queued.len() }),
             );
-            for d in &kept {
-                let shown = wire::display(&wire::path(d));
-                if self.scan_lock.try_lock().is_err() {
-                    let (what, secs) = match self.activity.current_scan() {
-                        Some((p, kind, secs)) => (
-                            format!("the {kind} scan of {}", wire::display(&wire::path(&p))),
-                            secs,
-                        ),
-                        None => ("another scan".to_string(), 0),
-                    };
+            self.rescan_folders(
+                &kept,
+                |what, secs| {
                     report(
                         "waiting",
                         format!(
-                            "waiting for {what} in progress ({secs} s so far) before rescanning {shown}"
+                            "waiting for {what} in progress ({secs} s so far) before rescanning"
                         ),
                         json!({ "for": what, "secs": secs }),
                     );
-                }
-                let started = std::time::Instant::now();
-                if let Err(e) = self.refresh_with(d, true, true).await {
-                    tracing::warn!("locate: rescanning {}: {e:#}", d.display());
-                }
-                let took = ms(started);
-                report(
-                    "rescanned",
-                    format!("rescanned {shown} in {took:.0} ms"),
-                    json!({ "folder": wire::path(d), "ms": took }),
-                );
-            }
+                },
+                |d, took| {
+                    report(
+                        "rescanned",
+                        format!(
+                            "rescanned {} in {took:.0} ms",
+                            wire::display(&wire::path(d))
+                        ),
+                        json!({ "folder": wire::path(d), "ms": took }),
+                    );
+                },
+            )
+            .await?;
             rescanned = kept;
             rescan_ms = ms(t);
             let t = std::time::Instant::now();
@@ -1569,6 +1576,25 @@ impl Engine {
             tracing::debug!("waiting for the scan in progress");
         }
         let guard = self.scan_lock.lock().await;
+        let stats = self.scan_locked(path, opts, kind).await?;
+        let config = self.config();
+        if config.root_for(&stats.root).is_none_or(|r| r.classify) {
+            self.classify_logged(&stats.root).await;
+        }
+        drop(guard);
+        self.queue_hashing(config.content_id_targets(&stats.root))
+            .await;
+        Ok(report(&stats))
+    }
+
+    /// One scan, with the scan lock already held: index, offline volumes,
+    /// events. Classification and hashing are the caller's.
+    async fn scan_locked(
+        &self,
+        path: &Path,
+        opts: ScanOptions,
+        kind: &'static str,
+    ) -> Result<ScanStats> {
         let _scanning = self.activity.scanning(path, kind);
         tracing::debug!("started (excludes: {:?})", opts.exclude);
         let stats = self.index.scan(path, opts).await?;
@@ -1603,26 +1629,30 @@ impl Engine {
             stats.retotalled,
             steward_index::rss()
         );
-        let config = self.config();
-        if config.root_for(&stats.root).is_none_or(|r| r.classify) {
-            let t = std::time::Instant::now();
-            match self.classify(&stats.root).await {
-                Ok(s) => tracing::debug!(
-                    "classified {} entries, {} tags in {} ms (load {} ms, rules {} ms, \
+        Ok(stats)
+    }
+
+    async fn classify_logged(&self, path: &Path) {
+        let t = std::time::Instant::now();
+        match self.classify(path).await {
+            Ok(s) => tracing::debug!(
+                "classified {} entries, {} tags in {} ms (load {} ms, rules {} ms, \
                      write {} ms); {}",
-                    s.scanned,
-                    s.tagged,
-                    t.elapsed().as_millis(),
-                    s.load_ms,
-                    s.rules_ms,
-                    s.write_ms,
-                    steward_index::rss()
-                ),
-                Err(e) => tracing::error!("classifying: {e:#}"),
-            }
+                s.scanned,
+                s.tagged,
+                t.elapsed().as_millis(),
+                s.load_ms,
+                s.rules_ms,
+                s.write_ms,
+                steward_index::rss()
+            ),
+            Err(e) => tracing::error!("classifying: {e:#}"),
         }
-        drop(guard);
-        for target in config.content_id_targets(&stats.root) {
+    }
+
+    /// Queue content-id work for `targets`, skipping folders already queued.
+    async fn queue_hashing(&self, targets: Vec<PathBuf>) {
+        for target in targets {
             match &self.hash_queue {
                 Some(tx) => {
                     let fresh = self
@@ -1644,13 +1674,97 @@ impl Engine {
                 }
             }
         }
-        Ok(report(&stats))
+    }
+
+    /// Rescan several folders as one job: each folder's own listing (its
+    /// subfolders trusted), under one hold of the scan lock, then
+    /// classification once per repository or root they share, then hashing.
+    /// `waiting` hears about a scan already running; `done` about each folder.
+    pub async fn rescan_folders(
+        &self,
+        dirs: &[PathBuf],
+        waiting: impl Fn(String, u64),
+        done: impl Fn(&Path, f64),
+    ) -> Result<()> {
+        if dirs.is_empty() {
+            return Ok(());
+        }
+        let span = tracing::info_span!("rescan", folders = dirs.len());
+        async {
+            if self.scan_lock.try_lock().is_err() {
+                let (what, secs) = match self.activity.current_scan() {
+                    Some((p, kind, secs)) => (
+                        format!("the {kind} scan of {}", wire::display(&wire::path(&p))),
+                        secs,
+                    ),
+                    None => ("another scan".to_string(), 0),
+                };
+                waiting(what, secs);
+            }
+            let guard = self.scan_lock.lock().await;
+            let config = self.config();
+            let mut total = ScanStats::default();
+            let mut classify_from = std::collections::BTreeSet::new();
+            let mut targets = std::collections::BTreeSet::new();
+            for d in dirs {
+                let started = std::time::Instant::now();
+                let mut opts = self.scan_options(d, true);
+                opts.read_root = true;
+                match self.scan_locked(d, opts, "trusting").await {
+                    Ok(stats) => {
+                        total.dirs_read += stats.dirs_read;
+                        total.dirs_trusted += stats.dirs_trusted;
+                        total.entries_seen += stats.entries_seen;
+                        total.inserted += stats.inserted;
+                        total.updated += stats.updated;
+                        total.deleted += stats.deleted;
+                        total.errors += stats.errors;
+                        total.offline.extend(stats.offline.iter().cloned());
+                        if config.root_for(&stats.root).is_none_or(|r| r.classify)
+                            && let Some(from) = self.classify_origin(&stats.root).await?
+                        {
+                            classify_from.insert(from);
+                        }
+                        targets.extend(config.content_id_targets(&stats.root));
+                    }
+                    Err(e) => tracing::warn!("rescanning {}: {e:#}", d.display()),
+                }
+                done(d, started.elapsed().as_secs_f64() * 1e3);
+            }
+            // A repository's classification covers every folder in it.
+            let mut origins: Vec<PathBuf> = Vec::new();
+            for from in classify_from {
+                if !origins.last().is_some_and(|o| from.starts_with(o)) {
+                    origins.push(from);
+                }
+            }
+            for from in &origins {
+                self.classify_logged(from).await;
+            }
+            drop(guard);
+            self.queue_hashing(targets.into_iter().collect()).await;
+            total.root = common_ancestor(dirs);
+            self.record_scan(&total.root, "folders", &Ok(report(&total)));
+            Ok(())
+        }
+        .instrument(span)
+        .await
     }
 
     /// Classification needs a repository's ignore rules, so classify from the
     /// enclosing repository; below an already-classified directory there is
     /// nothing to do.
     pub async fn classify(&self, path: &Path) -> Result<steward_classify::Summary> {
+        match self.classify_origin(path).await? {
+            Some(from) => steward_classify::classify(&self.index, &from).await,
+            None => Ok(steward_classify::Summary::default()),
+        }
+    }
+
+    /// Where classifying `path` has to start: its enclosing repository (for
+    /// the ignore rules above it), or itself; None below a directory that is
+    /// already classified (build output, caches…), where nothing changes.
+    async fn classify_origin(&self, path: &Path) -> Result<Option<PathBuf>> {
         let conn = self.index.connect()?;
         let mut from = path.to_path_buf();
         for anc in path.ancestors() {
@@ -1659,13 +1773,13 @@ impl Engine {
             };
             let tags = self.index.tags_of(&conn, id).await?;
             if anc != path && tags.iter().any(|t| t != "classify:repo") {
-                return Ok(steward_classify::Summary::default());
+                return Ok(None);
             }
             if tags.iter().any(|t| t == "classify:repo") {
                 from = anc.to_path_buf();
             }
         }
-        steward_classify::classify(&self.index, &from).await
+        Ok(Some(from))
     }
 
     pub async fn content_id(

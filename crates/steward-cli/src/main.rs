@@ -131,8 +131,7 @@ enum Cmd {
         #[arg(short = 't', long = "type", value_enum)]
         kind: Option<TypeArg>,
         /// Confirm results on disk: skip (trust the index), warn about gone
-        /// ones, prompt to rescan, or rescan the folders of gone ones and ask
-        /// again.
+        /// ones, or rescan the folders of gone ones and search again.
         #[arg(long, value_enum, default_value_t = CheckArg::Rescan)]
         check: CheckArg,
         /// No timing and rescan report on stderr.
@@ -266,7 +265,6 @@ enum TypeArg {
 enum CheckArg {
     Skip,
     Warn,
-    Prompt,
     Rescan,
 }
 
@@ -667,21 +665,7 @@ fn run(cli: Cli) -> Result<()> {
             } else {
                 LocateCheck::Exists
             };
-            let mut r: Located = serde_json::from_value(ask(first)?)?;
-            if check == CheckArg::Prompt
-                && !r.stale.is_empty()
-                && std::io::IsTerminal::is_terminal(&std::io::stdin())
-            {
-                eprint!(
-                    "steward: {} results are gone from disk; rescan their folders? [Y/n] ",
-                    r.stale.len()
-                );
-                let mut answer = String::new();
-                std::io::stdin().read_line(&mut answer)?;
-                if !answer.trim().eq_ignore_ascii_case("n") {
-                    r = serde_json::from_value(ask(LocateCheck::Rescan)?)?;
-                }
-            }
+            let r: Located = serde_json::from_value(ask(first)?)?;
             for p in &r.paths {
                 print_path(p);
             }

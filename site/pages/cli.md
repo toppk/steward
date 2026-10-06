@@ -103,7 +103,7 @@ path as its raw bytes (so its output can be fed back to `stat`, `xargs -d
     time, subtree totals, tags (including inherited ones), file category and
     current content id.
 
-`steward locate PATTERN [-x | -g | -r] [-i] [-t f|d|l|o] [--check MODE] [-l LIMIT]`
+`steward locate PATTERN [-x | -g | -r] [-i] [-t f|d|l|o] [--check MODE] [-l LIMIT] [-q]`
 :   Paths whose final name component matches. By default, like classic
     `locate`: a case-insensitive substring, or a case-sensitive glob over the
     whole name if the pattern has `*`, `?` or `[`. At most `LIMIT` results
@@ -122,8 +122,7 @@ path as its raw bytes (so its output can be fed back to `stat`, `xargs -d
 
     | `--check` | |
     |---|---|
-    | `rescan` *(default)* | check each result; rescan the folder of each one that's gone (or its nearest surviving parent), then search again, so renamed files show up under their new names |
-    | `prompt` | check, then ask before rescanning (as `warn` when not run interactively) |
+    | `rescan` *(default)* | check each result; rescan the folders of the ones that are gone (each one's folder, or its nearest surviving parent) as one job, then search again, so renamed files show up under their new names |
     | `warn` | check, leave gone results out and say how many |
     | `skip` | trust the index; fastest |
 
