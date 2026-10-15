@@ -137,6 +137,10 @@ enum Cmd {
         /// No timing and rescan report on stderr.
         #[arg(short, long)]
         quiet: bool,
+        /// Wait for every match and print them sorted. The default when the
+        /// output isn't a terminal; on a terminal matches print as found.
+        #[arg(long)]
+        sort: bool,
     },
     /// Re-run classification (repositories, build output, caches…) under PATH.
     Classify { path: PathBuf },
@@ -393,10 +397,19 @@ impl Backend {
         }
     }
 
-    /// `request` with progress reports printed to stderr as they arrive.
-    fn request_with_progress(&mut self, req: &Request) -> Result<Value> {
-        let show = |v: &Value| {
-            if let Some(m) = v["message"].as_str() {
+    /// `request` with progress reports printed to stderr as they arrive
+    /// (unless `quiet`), and streamed results printed to stdout.
+    fn request_with_progress(&mut self, req: &Request, quiet: bool) -> Result<Value> {
+        let show = move |v: &Value| {
+            if v["stage"] == "results" {
+                for p in v["paths"].as_array().into_iter().flatten() {
+                    print_path(p.as_str().unwrap_or_default());
+                }
+                return;
+            }
+            if let Some(m) = v["message"].as_str().filter(|m| !m.is_empty())
+                && !quiet
+            {
                 eprintln!("steward: {m}");
             }
         };
@@ -571,6 +584,7 @@ fn run(cli: Cli) -> Result<()> {
         Cmd::Scan { path, trust } => c.request(&Request::Scan {
             path: abs(path)?,
             trust_dir_mtime: trust,
+            read_root: trust,
         })?,
         Cmd::Invalidate { path } => c.request(&Request::Invalidate { path: abs(path)? })?,
         Cmd::Ls { path, by } => {
@@ -606,6 +620,7 @@ fn run(cli: Cli) -> Result<()> {
             kind,
             check,
             quiet,
+            sort,
         } => {
             use steward_proto::{LocateCheck, LocateMode, Located};
             let started = std::time::Instant::now();
@@ -629,6 +644,7 @@ fn run(cli: Cli) -> Result<()> {
                 TypeArg::Symlink => steward_proto::Kind::Symlink,
                 TypeArg::Other => steward_proto::Kind::Other,
             });
+            let stream = !sort && std::io::IsTerminal::is_terminal(&std::io::stdout());
             let mut ask = |check| {
                 let req = Request::Locate {
                     pattern: pattern.clone(),
@@ -637,18 +653,21 @@ fn run(cli: Cli) -> Result<()> {
                     ignore_case,
                     kind: kind.clone(),
                     check,
+                    stream,
                 };
-                if quiet {
+                if quiet && !stream {
                     c.request(&req)
                 } else {
-                    c.request_with_progress(&req)
+                    c.request_with_progress(&req, quiet)
                 }
             };
             if check == CheckArg::Skip {
                 let found = ask(LocateCheck::None)?;
                 let found = found.as_array().cloned().unwrap_or_default();
-                for p in &found {
-                    print_path(p.as_str().unwrap_or_default());
+                if !stream {
+                    for p in &found {
+                        print_path(p.as_str().unwrap_or_default());
+                    }
                 }
                 note(format!(
                     "{} in {} (from the index, not checked on disk)",
@@ -666,8 +685,10 @@ fn run(cli: Cli) -> Result<()> {
                 LocateCheck::Exists
             };
             let r: Located = serde_json::from_value(ask(first)?)?;
-            for p in &r.paths {
-                print_path(p);
+            if !stream {
+                for p in &r.paths {
+                    print_path(p);
+                }
             }
             note(format!(
                 "{} in {}: search {}, check on disk {}{}",

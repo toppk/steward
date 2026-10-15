@@ -212,6 +212,7 @@ first. Each child carries only its own tags.
 | `ignore_case` | for `exact`, `glob` and `regex`; substrings always ignore ASCII case |
 | `kind` | `file`, `dir`, `symlink` or `other` |
 | `check` | `none`: answer from the index. `exists`: `lstat` each result. `rescan`: also rescan the folder of each result that's gone (or its nearest existing parent; at most 64 at once, the rest queued) and search again |
+| `stream` | with `"progress": true`: send matches as they are found, in `progress` notifications with `stage: "results"` and `paths` (checked first when `check` asks; after a rescan, only matches not sent yet). The first goes out at once, then one every 100 ms or 500 matches. The full sorted answer still follows. |
 
 Results are sorted by their bytes. A rescan has to wait for any scan
 already running, such as a root's scheduled full rescan; with
@@ -386,9 +387,10 @@ epoch, re-resolve whatever you track.
 
 ### scan
 
-`{path, trust_dir_mtime = false}` → ScanReport. Rescan `path` (a root or
-anything under one) now and wait. `trust_dir_mtime` skips directories whose
-times show nothing changed. Error: `not_under_root`.
+`{path, trust_dir_mtime = false, read_root = false}` → ScanReport. Rescan
+`path` (a root or anything under one) now and wait. `trust_dir_mtime` skips
+directories whose times show nothing changed; `read_root` still reads
+`path`'s own listing. Error: `not_under_root`.
 
 ### classify
 

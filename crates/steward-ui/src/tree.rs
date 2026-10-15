@@ -5,10 +5,11 @@ use gpui_kit::base::ScrollbarAxis;
 use gpui_kit::base::input::{InputEvent, InputState};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AppContext as _, ClickEvent, Context, Div, Entity, FocusHandle, Focusable as _, Hsla,
-    InteractiveElement as _, IntoElement, KeyDownEvent, ParentElement as _, Rems, Render,
-    ScrollStrategy, SharedString, StatefulInteractiveElement as _, Styled as _, Subscription,
-    UniformListScrollHandle, Window, div, relative, rems, uniform_list,
+    AppContext as _, ClickEvent, ClipboardItem, Context, Div, Entity, FocusHandle, Focusable as _,
+    Hsla, InteractiveElement as _, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent,
+    ParentElement as _, Pixels, Point, Rems, Render, ScrollStrategy, SharedString,
+    StatefulInteractiveElement as _, Styled as _, Subscription, UniformListScrollHandle, Window,
+    anchored, deferred, div, relative, rems, uniform_list,
 };
 use gpui_omarchy::{
     ActiveTheme as _, ButtonVariant, Theme, button, input, scrollbar, with_tooltip,
@@ -124,6 +125,8 @@ pub struct TreeView {
     measure: Measure,
     locate_mode: LocateMode,
     locate_ignore_case: bool,
+    /// The row a right-click menu is open for, and where.
+    context_menu: Option<(usize, Point<Pixels>)>,
     polling: bool,
     _subscriptions: Vec<Subscription>,
 }
@@ -157,6 +160,7 @@ impl TreeView {
             measure: Measure::Space,
             locate_mode: LocateMode::Auto,
             locate_ignore_case: false,
+            context_menu: None,
             _subscriptions: vec![sub],
         };
         this.load_root(None, cx);
@@ -403,6 +407,13 @@ impl TreeView {
     }
 
     fn rescan_selected(&mut self, cx: &mut Context<'_, Self>) {
+        self.rescan(false, cx);
+    }
+
+    /// Rescan the selected folder (a file's own folder): everything below it,
+    /// or with `folder_only` just its own listing, trusting the folders
+    /// below whose times say nothing changed.
+    fn rescan(&mut self, folder_only: bool, cx: &mut Context<'_, Self>) {
         let Some(row) = self.rows.get(self.selected) else {
             return;
         };
@@ -419,7 +430,8 @@ impl TreeView {
             fetch(move |c| {
                 c.request(&Request::Scan {
                     path,
-                    trust_dir_mtime: false,
+                    trust_dir_mtime: folder_only,
+                    read_root: folder_only,
                 })
             })()
         });
@@ -535,6 +547,11 @@ impl TreeView {
     fn on_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<'_, Self>) {
         let ks = &ev.keystroke;
         let key = ks.key.as_str();
+        if self.context_menu.is_some() && key == "escape" {
+            self.context_menu = None;
+            cx.notify();
+            return;
+        }
         let searching = self.locate.read(cx).focus_handle(cx).is_focused(window);
         if searching {
             if key == "escape" || key == "down" {
@@ -691,6 +708,15 @@ fn tree_row(
         .items_center()
         .when(selected, |d| d.bg(theme.selection))
         .hover(|d| d.bg(theme.surface))
+        .on_mouse_down(
+            MouseButton::Right,
+            cx.listener(move |this, ev: &MouseDownEvent, window, cx| {
+                this.selected = ix;
+                this.context_menu = Some((ix, ev.position));
+                window.focus(&this.focus, cx);
+                cx.notify();
+            }),
+        )
         .on_click(cx.listener(move |this, ev: &ClickEvent, window, cx| {
             this.selected = ix;
             if ev.click_count() >= 2 {
@@ -836,6 +862,84 @@ fn status_line(row: Option<&Row>, theme: &Theme, cx: &mut Context<'_, TreeView>)
             ),
         )
     })
+}
+
+impl TreeView {
+    /// The right-click menu for row `ix`.
+    fn row_menu(&self, ix: usize, theme: &Theme, cx: &mut Context<'_, Self>) -> impl IntoElement {
+        let Some(row) = self.rows.get(ix) else {
+            return div().into_any_element();
+        };
+        let path = row.entry.path.clone();
+        let content_id = row.entry.content_id.clone();
+        let (whole, own) = if row.is_dir() {
+            (
+                "Rescan folder and everything below",
+                "Rescan this folder only",
+            )
+        } else {
+            (
+                "Rescan its folder and everything below",
+                "Rescan its folder only",
+            )
+        };
+        let item = |id: &'static str, label: &str| {
+            div()
+                .id(id)
+                .px(rems(0.75))
+                .py(rems(0.375))
+                .rounded(rems(0.25))
+                .cursor_pointer()
+                .hover(|d| d.bg(theme.selection))
+                .child(label.to_string())
+        };
+        div()
+            .id("row-menu")
+            .flex()
+            .flex_col()
+            .min_w(rems(16.0))
+            .p(rems(0.25))
+            .bg(theme.surface)
+            .border_1()
+            .border_color(theme.border)
+            .rounded(rems(0.375))
+            .shadow_md()
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                this.context_menu = None;
+                cx.notify();
+            }))
+            .child(
+                item("menu-rescan", whole).on_click(cx.listener(move |this, _, _, cx| {
+                    this.context_menu = None;
+                    this.selected = ix;
+                    this.rescan(false, cx);
+                })),
+            )
+            .child(
+                item("menu-rescan-own", own).on_click(cx.listener(move |this, _, _, cx| {
+                    this.context_menu = None;
+                    this.selected = ix;
+                    this.rescan(true, cx);
+                })),
+            )
+            .when_some(content_id, |d, id| {
+                d.child(item("menu-copies", "Show all copies").on_click(cx.listener(
+                    move |this, _, _, cx| {
+                        this.context_menu = None;
+                        cx.emit(TreeEvent::ShowContent(id.clone()));
+                        cx.notify();
+                    },
+                )))
+            })
+            .child(
+                item("menu-copy", "Copy path").on_click(cx.listener(move |this, _, _, cx| {
+                    this.context_menu = None;
+                    cx.write_to_clipboard(ClipboardItem::new_string(wire::display(&path)));
+                    cx.notify();
+                })),
+            )
+            .into_any_element()
+    }
 }
 
 impl Render for TreeView {
@@ -1073,6 +1177,11 @@ impl Render for TreeView {
             .font_family(theme.font.clone())
             .text_size(rems(0.8125))
             .child(toolbar)
+            .when_some(self.context_menu, |d, (ix, at)| {
+                d.child(deferred(
+                    anchored().position(at).child(self.row_menu(ix, &theme, cx)),
+                ))
+            })
             .when(self.mode == Mode::Tree, |d| {
                 d.child(header(self.measure, &theme))
             })

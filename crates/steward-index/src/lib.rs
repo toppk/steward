@@ -193,6 +193,9 @@ pub enum ChangeKind {
     Changed,
 }
 
+/// How often a streaming name search hands over what it has found.
+const STREAM_EVERY: std::time::Duration = std::time::Duration::from_millis(100);
+
 /// After this many point lookups a scan loads every hashed inode instead.
 const LINK_LOOKUPS: u32 = 2048;
 
@@ -1595,6 +1598,23 @@ impl Index {
         conn: &Connection,
         q: &NameQuery<'_>,
     ) -> Result<Vec<(i64, PathBuf)>> {
+        let mut out = Vec::new();
+        self.find_names_streaming(conn, q, &mut |batch| out.extend(batch))
+            .await?;
+        Ok(out)
+    }
+
+    /// `find_names`, handing matches to `on_batch` as the search finds them:
+    /// the first at once, then every 100 ms or 500 matches. A search reads
+    /// every name, so on a large index the first matches arrive long before
+    /// the last.
+    pub async fn find_names_streaming(
+        &self,
+        conn: &Connection,
+        q: &NameQuery<'_>,
+        on_batch: &mut (dyn FnMut(Vec<(i64, PathBuf)>) + Send),
+    ) -> Result<()> {
+        type Keep = Box<dyn Fn(&[u8]) -> bool + Send + Sync>;
         let mode = match q.mode {
             MatchMode::Auto if q.pattern.contains(['*', '?', '[']) => MatchMode::Glob,
             MatchMode::Auto => MatchMode::Substring,
@@ -1615,26 +1635,39 @@ impl Index {
                 ),
             };
         let limit = i64::from(q.limit);
-        let ids = match (mode, q.ignore_case) {
-            (MatchMode::Substring, _) => {
-                let sql =
-                    format!("SELECT id FROM entries WHERE name LIKE ?1 ESCAPE '\\'{kind} LIMIT ?2");
-                Self::ids(conn, &sql, (format!("%{}%", like_escape(q.pattern)), limit)).await?
-            }
-            (MatchMode::Exact, false) => {
-                let sql = format!("SELECT id FROM entries WHERE name = ?1{kind} LIMIT ?2");
-                let name = Value::Blob(q.pattern.as_bytes().to_vec());
-                Self::ids(conn, &sql, (name, limit)).await?
-            }
-            (MatchMode::Exact, true) => {
-                let sql =
-                    format!("SELECT id FROM entries WHERE name LIKE ?1 ESCAPE '\\'{kind} LIMIT ?2");
-                Self::ids(conn, &sql, (like_escape(q.pattern), limit)).await?
-            }
-            (MatchMode::Glob, false) => {
-                let sql = format!("SELECT id FROM entries WHERE name GLOB ?1{kind} LIMIT ?2");
-                Self::ids(conn, &sql, (q.pattern.to_string(), limit)).await?
-            }
+        // Exact names, substrings and case-sensitive globs are SQL's to
+        // match; the rest are matched here, name by name.
+        let (sql, params, keep): (String, Vec<Value>, Option<Keep>) = match (mode, q.ignore_case) {
+            (MatchMode::Substring, _) => (
+                format!(
+                    "SELECT id, name FROM entries WHERE name LIKE ?1 ESCAPE '\\'{kind} LIMIT ?2"
+                ),
+                vec![
+                    Value::Text(format!("%{}%", like_escape(q.pattern))),
+                    Value::Integer(limit),
+                ],
+                None,
+            ),
+            (MatchMode::Exact, false) => (
+                format!("SELECT id, name FROM entries WHERE name = ?1{kind} LIMIT ?2"),
+                vec![
+                    Value::Blob(q.pattern.as_bytes().to_vec()),
+                    Value::Integer(limit),
+                ],
+                None,
+            ),
+            (MatchMode::Exact, true) => (
+                format!(
+                    "SELECT id, name FROM entries WHERE name LIKE ?1 ESCAPE '\\'{kind} LIMIT ?2"
+                ),
+                vec![Value::Text(like_escape(q.pattern)), Value::Integer(limit)],
+                None,
+            ),
+            (MatchMode::Glob, false) => (
+                format!("SELECT id, name FROM entries WHERE name GLOB ?1{kind} LIMIT ?2"),
+                vec![Value::Text(q.pattern.to_string()), Value::Integer(limit)],
+                None,
+            ),
             (MatchMode::Glob, true) => {
                 let glob = globset::GlobBuilder::new(q.pattern)
                     .case_insensitive(true)
@@ -1642,56 +1675,58 @@ impl Index {
                     .build()
                     .with_context(|| format!("invalid glob {:?}", q.pattern))?
                     .compile_matcher();
-                Self::filter_names(conn, &kind, q.limit, |n| {
-                    glob.is_match(OsStr::from_bytes(n))
-                })
-                .await?
+                (
+                    format!("SELECT id, name FROM entries WHERE 1 = 1{kind}"),
+                    vec![],
+                    Some(Box::new(move |n: &[u8]| {
+                        glob.is_match(OsStr::from_bytes(n))
+                    })),
+                )
             }
             (MatchMode::Regex, ic) => {
                 let re = regex::bytes::RegexBuilder::new(q.pattern)
                     .case_insensitive(ic)
                     .build()
                     .with_context(|| format!("invalid regular expression {:?}", q.pattern))?;
-                Self::filter_names(conn, &kind, q.limit, |n| re.is_match(n)).await?
+                (
+                    format!("SELECT id, name FROM entries WHERE 1 = 1{kind}"),
+                    vec![],
+                    Some(Box::new(move |n: &[u8]| re.is_match(n))),
+                )
             }
             (MatchMode::Auto, _) => unreachable!("resolved above"),
         };
+        // Paths are resolved on a second connection while this one's cursor
+        // walks the table.
+        let paths = self.connect()?;
         let mut cache = HashMap::new();
-        let mut out = Vec::with_capacity(ids.len());
-        for id in ids {
-            out.push((id, self.path_of(conn, id, &mut cache).await?));
-        }
-        Ok(out)
-    }
-
-    async fn ids(conn: &Connection, sql: &str, params: impl turso::IntoParams) -> Result<Vec<i64>> {
-        let mut rows = query(conn, sql, params).await?;
-        let mut ids = Vec::new();
+        let mut rows = query(conn, &sql, params).await?;
+        let mut batch = Vec::new();
+        let mut found = 0u32;
+        let mut sent_any = false;
+        let mut last = Instant::now();
         while let Some(row) = rows.next().await? {
-            ids.push(int(&row, 0)?);
-        }
-        Ok(ids)
-    }
-
-    /// Every name in the index through `keep`, up to `limit` matches.
-    async fn filter_names(
-        conn: &Connection,
-        kind: &str,
-        limit: u32,
-        keep: impl Fn(&[u8]) -> bool,
-    ) -> Result<Vec<i64>> {
-        let sql = format!("SELECT id, name FROM entries WHERE 1 = 1{kind}");
-        let mut rows = query(conn, &sql, ()).await?;
-        let mut ids = Vec::new();
-        while let Some(row) = rows.next().await? {
-            if keep(&blob(&row, 1)?) {
-                ids.push(int(&row, 0)?);
-                if ids.len() >= limit as usize {
-                    break;
-                }
+            if let Some(keep) = &keep
+                && !keep(&blob(&row, 1)?)
+            {
+                continue;
+            }
+            let id = int(&row, 0)?;
+            batch.push((id, self.path_of(&paths, id, &mut cache).await?));
+            found += 1;
+            if !sent_any || batch.len() >= 500 || last.elapsed() >= STREAM_EVERY {
+                on_batch(std::mem::take(&mut batch));
+                sent_any = true;
+                last = Instant::now();
+            }
+            if found >= q.limit {
+                break;
             }
         }
-        Ok(ids)
+        if !batch.is_empty() {
+            on_batch(batch);
+        }
+        Ok(())
     }
 
     /// Every entry under `id` (inclusive) with its path.

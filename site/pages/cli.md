@@ -103,7 +103,7 @@ path as its raw bytes (so its output can be fed back to `stat`, `xargs -d
     time, subtree totals, tags (including inherited ones), file category and
     current content id.
 
-`steward locate PATTERN [-x | -g | -r] [-i] [-t f|d|l|o] [--check MODE] [-l LIMIT] [-q]`
+`steward locate PATTERN [-x | -g | -r] [-i] [-t f|d|l|o] [--check MODE] [-l LIMIT] [-q] [--sort]`
 :   Paths whose final name component matches. By default, like classic
     `locate`: a case-insensitive substring, or a case-sensitive glob over the
     whole name if the pattern has `*`, `?` or `[`. At most `LIMIT` results
@@ -126,8 +126,10 @@ path as its raw bytes (so its output can be fed back to `stat`, `xargs -d
     | `warn` | check, leave gone results out and say how many |
     | `skip` | trust the index; fastest |
 
-    Results are sorted by their bytes, as `LC_ALL=C sort` would. The paths
-    alone go to stdout. Rescans are reported on stderr as they happen,
+    On a terminal, matches print as the search finds them, so the first ones
+    appear at once; when stdout is a pipe or file (or with `--sort`) they
+    are printed sorted by their bytes, as `LC_ALL=C sort` would, once the
+    search is done. The paths alone go to stdout. Rescans are reported on stderr as they happen,
     including any wait for a scan already running (such as a root's daily
     full rescan), so a slow answer says why:
 
@@ -189,8 +191,10 @@ path as its raw bytes (so its output can be fed back to `stat`, `xargs -d
 ## Keeping current
 
 `steward scan PATH [--trust]`
-:   Rescan `PATH` now and wait for it. `--trust` skips directories whose
-    times show nothing changed. The path must be under a configured root.
+:   Rescan `PATH` now and wait for it. `--trust` reads `PATH`'s own listing
+    but skips the directories below it whose times show nothing changed: the
+    quick way to catch up a folder you just cleaned up. The path must be
+    under a configured root.
 
 `steward invalidate PATH`
 :   Tell the daemon something under `PATH` changed. It rescans a couple of

@@ -560,9 +560,10 @@ impl Engine {
             Request::Scan {
                 path,
                 trust_dir_mtime,
+                read_root,
             } => {
                 self.require_root(&path)?;
-                serde_json::to_value(self.refresh(&path, trust_dir_mtime).await?)?
+                serde_json::to_value(self.refresh_with(&path, trust_dir_mtime, read_root).await?)?
             }
             Request::Invalidate { path } => match &self.invalidate {
                 Some(tx) => {
@@ -603,6 +604,7 @@ impl Engine {
                 ignore_case,
                 kind,
                 check,
+                stream,
             } => {
                 let q = steward_index::NameQuery {
                     pattern: &pattern,
@@ -622,7 +624,7 @@ impl Engine {
                         steward_proto::Kind::Other => KindFilter::Other,
                     }),
                 };
-                self.locate(&conn, &q, check, progress.as_ref())
+                self.locate(&conn, &q, check, stream, progress.as_ref())
                     .await
                     .map_err(|e| match e.downcast_ref::<Failure>() {
                         Some(_) => e,
@@ -766,6 +768,7 @@ impl Engine {
         conn: &turso::Connection,
         q: &steward_index::NameQuery<'_>,
         check: LocateCheck,
+        stream: bool,
         progress: Option<&Progress>,
     ) -> Result<Value> {
         let report = |stage: &str, message: String, extra: Value| {
@@ -790,8 +793,36 @@ impl Engine {
             hits.sort_by(|a, b| a.as_os_str().as_bytes().cmp(b.as_os_str().as_bytes()));
             Ok(hits)
         };
+        let present =
+            |p: &Path| Meta::lstat(p).is_ok_and(|m| q.kind.is_none_or(|k| kind_matches(k, m.kind)));
+        // Streaming: matches go out as the search finds them (checked first
+        // if asked), and the full sorted answer follows.
+        let streaming = stream && progress.is_some();
+        let mut sent: HashSet<PathBuf> = HashSet::new();
         let t = std::time::Instant::now();
-        let mut hits = find().await?;
+        let mut hits = if streaming {
+            let mut all = Vec::new();
+            let mut on_batch = |batch: Vec<(i64, PathBuf)>| {
+                let mut fresh = Vec::new();
+                for (_, p) in batch {
+                    if check == LocateCheck::None || present(&p) {
+                        fresh.push(wire::path(&p));
+                        sent.insert(p.clone());
+                    }
+                    all.push(p);
+                }
+                if !fresh.is_empty() {
+                    report("results", String::new(), json!({ "paths": fresh }));
+                }
+            };
+            self.index
+                .find_names_streaming(conn, q, &mut on_batch)
+                .await?;
+            all.sort_by(|a, b| a.as_os_str().as_bytes().cmp(b.as_os_str().as_bytes()));
+            all
+        } else {
+            find().await?
+        };
         let mut search_ms = ms(t);
         let limited = hits.len() >= q.limit as usize;
         if check == LocateCheck::None {
@@ -800,9 +831,7 @@ impl Engine {
             ));
         }
         let gone = |hits: &[PathBuf]| -> (Vec<PathBuf>, Vec<PathBuf>) {
-            hits.iter().cloned().partition(|p| {
-                Meta::lstat(p).is_ok_and(|m| q.kind.is_none_or(|k| kind_matches(k, m.kind)))
-            })
+            hits.iter().cloned().partition(|p| present(p))
         };
         let t = std::time::Instant::now();
         let (mut paths, mut stale) = gone(&hits);
@@ -882,6 +911,16 @@ impl Engine {
             let t = std::time::Instant::now();
             (paths, stale) = gone(&hits);
             check_ms += ms(t);
+            if streaming {
+                let fresh: Vec<String> = paths
+                    .iter()
+                    .filter(|p| !sent.contains(*p))
+                    .map(|p| wire::path(p))
+                    .collect();
+                if !fresh.is_empty() {
+                    report("results", String::new(), json!({ "paths": fresh }));
+                }
+            }
         }
         let show = |v: Vec<PathBuf>| -> Vec<String> { v.iter().map(|p| wire::path(p)).collect() };
         Ok(serde_json::to_value(steward_proto::Located {

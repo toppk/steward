@@ -34,6 +34,11 @@ percentages by. Items counts every entry beneath (files, directories,
 symlinks), which is what fills a filesystem's inodes or btrfs metadata.
 Expanded folders and the selection are kept.
 
+**Right-click** a row for a menu: **Rescan folder and everything below**
+(as <kbd>r</kbd>), **Rescan this folder only** (its own listing, trusting the
+folders below; quick, after you've cleaned something up), **Show all
+copies** for a file with a content id, and **Copy path**.
+
 Selecting an entry shows its details: path, mode, owner, space on disk and
 apparent size, counts, and its content id if it has one. **All locations**
 opens the Content ids tab on every path holding the same bytes.

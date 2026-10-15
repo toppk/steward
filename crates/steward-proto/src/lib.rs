@@ -57,6 +57,10 @@ pub enum Request {
         path: PathBuf,
         #[serde(default)]
         trust_dir_mtime: bool,
+        /// With `trust_dir_mtime`: still read `path`'s own listing, so a
+        /// folder just cleaned up is seen without reading everything below.
+        #[serde(default)]
+        read_root: bool,
     },
     /// An application changed something under `path`; rescan it soon.
     Invalidate {
@@ -87,6 +91,10 @@ pub enum Request {
         kind: Option<Kind>,
         #[serde(default)]
         check: LocateCheck,
+        /// With `"progress": true`: send matches as `results` progress
+        /// notifications while the search runs, before the full answer.
+        #[serde(default)]
+        stream: bool,
     },
     Classify {
         #[serde(with = "wire::serde_path")]
@@ -626,6 +634,7 @@ impl Client {
             ignore_case: false,
             kind: None,
             check: LocateCheck::None,
+            stream: false,
         })?)
         .map_err(Error::from)
     }
@@ -648,6 +657,7 @@ impl Client {
             ignore_case,
             kind,
             check,
+            stream: false,
         })?)
         .map_err(Error::from)
     }
