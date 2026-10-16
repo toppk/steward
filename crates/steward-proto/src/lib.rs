@@ -91,8 +91,8 @@ pub enum Request {
         kind: Option<Kind>,
         #[serde(default)]
         check: LocateCheck,
-        /// With `"progress": true`: send matches as `results` progress
-        /// notifications while the search runs, before the full answer.
+        /// With `"progress": true` and a substring search: send the exact
+        /// name matches first, as an `exact` progress notification.
         #[serde(default)]
         stream: bool,
     },
@@ -660,6 +660,40 @@ impl Client {
             stream: false,
         })?)
         .map_err(Error::from)
+    }
+
+    /// `locate_checked`, handing the exact name matches to `on_exact` as
+    /// soon as they are found, before the full answer.
+    #[allow(clippy::too_many_arguments)]
+    pub fn locate_streaming(
+        &mut self,
+        pattern: String,
+        limit: u32,
+        mode: LocateMode,
+        ignore_case: bool,
+        kind: Option<Kind>,
+        check: LocateCheck,
+        mut on_exact: impl FnMut(Vec<String>),
+    ) -> Result<Located, Error> {
+        let v = serde_json::to_value(Request::Locate {
+            pattern,
+            limit,
+            mode,
+            ignore_case,
+            kind,
+            check,
+            stream: true,
+        })?;
+        let mut params = v["params"].clone();
+        params["progress"] = Value::Bool(true);
+        let found = self.call_with_progress("locate", params, |p| {
+            if p["stage"] == "exact"
+                && let Ok(paths) = serde_json::from_value(p["paths"].clone())
+            {
+                on_exact(paths);
+            }
+        })?;
+        serde_json::from_value(found).map_err(Error::from)
     }
 }
 

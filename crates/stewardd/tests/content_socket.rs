@@ -388,34 +388,33 @@ fn locate_reports_rescans_as_progress_before_answering() {
 }
 
 #[test]
-fn locate_streams_matches_before_the_full_answer() {
+fn locate_sends_exact_names_before_the_full_answer() {
     use std::io::{BufRead, BufReader, Write};
     let d = Daemon::start();
+    let xa = d.data.join("films/xa.bin");
+    fs::write(&xa, b"x").unwrap();
+    let mut c = d.content();
+    c.call("inspect", json!({ "paths": [xa] })).unwrap();
     let mut s =
         std::os::unix::net::UnixStream::connect(d.run.join("steward/content.socket")).unwrap();
     let msg = json!({ "jsonrpc": "2.0", "id": 3, "method": "locate", "params": {
-        "pattern": ".bin", "check": "exists", "stream": true, "progress": true } });
+        "pattern": "a.bin", "check": "exists", "stream": true, "progress": true } });
     s.write_all(format!("{msg}\n").as_bytes()).unwrap();
-    let mut streamed: Vec<String> = Vec::new();
+    let mut exact = Value::Null;
     for line in BufReader::new(s).lines() {
         let v: Value = serde_json::from_str(&line.unwrap()).unwrap();
-        if v["method"] == "progress" && v["params"]["stage"] == "results" {
-            for p in v["params"]["paths"].as_array().unwrap() {
-                streamed.push(p.as_str().unwrap().to_string());
-            }
+        if v["method"] == "progress" && v["params"]["stage"] == "exact" {
+            exact = v["params"]["paths"].clone();
             continue;
         }
         assert_eq!(v["id"], 3);
-        let mut all: Vec<String> = v["result"]["paths"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|p| p.as_str().unwrap().to_string())
-            .collect();
-        streamed.sort();
-        all.sort();
-        assert_eq!(streamed, all, "everything streamed, nothing twice");
-        assert_eq!(all.len(), 2);
+        let a = d.data.join("films/a.bin");
+        assert_eq!(exact, json!([a]), "the exact name first");
+        assert_eq!(
+            v["result"]["paths"],
+            json!([a, xa]),
+            "then everything, sorted"
+        );
         break;
     }
 }

@@ -137,8 +137,8 @@ enum Cmd {
         /// No timing and rescan report on stderr.
         #[arg(short, long)]
         quiet: bool,
-        /// Wait for every match and print them sorted. The default when the
-        /// output isn't a terminal; on a terminal matches print as found.
+        /// Print every match in one sorted list, instead of exact name
+        /// matches first and then the rest.
         #[arg(long)]
         sort: bool,
     },
@@ -362,6 +362,9 @@ fn line(e: &Entry, parent: &Entry, by: By, indent: usize) {
     );
 }
 
+/// Paths already printed to stdout, ahead of the full answer.
+type Printed = std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>;
+
 /// The daemon over its socket, or the same engine in this process.
 enum Backend {
     Socket(Client),
@@ -398,12 +401,24 @@ impl Backend {
     }
 
     /// `request` with progress reports printed to stderr as they arrive
-    /// (unless `quiet`), and streamed results printed to stdout.
-    fn request_with_progress(&mut self, req: &Request, quiet: bool) -> Result<Value> {
+    /// (unless `quiet`), and paths sent ahead of the answer printed to
+    /// stdout and noted in `printed`.
+    fn request_with_progress(
+        &mut self,
+        req: &Request,
+        quiet: bool,
+        printed: &Printed,
+    ) -> Result<Value> {
+        let printed = std::sync::Arc::clone(printed);
         let show = move |v: &Value| {
-            if v["stage"] == "results" {
+            if v["stage"] == "exact" {
+                let mut printed = printed
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 for p in v["paths"].as_array().into_iter().flatten() {
-                    print_path(p.as_str().unwrap_or_default());
+                    let p = p.as_str().unwrap_or_default();
+                    print_path(p);
+                    printed.insert(p.to_string());
                 }
                 return;
             }
@@ -644,7 +659,8 @@ fn run(cli: Cli) -> Result<()> {
                 TypeArg::Symlink => steward_proto::Kind::Symlink,
                 TypeArg::Other => steward_proto::Kind::Other,
             });
-            let stream = !sort && std::io::IsTerminal::is_terminal(&std::io::stdout());
+            let stream = !sort;
+            let printed = Printed::default();
             let mut ask = |check| {
                 let req = Request::Locate {
                     pattern: pattern.clone(),
@@ -658,15 +674,18 @@ fn run(cli: Cli) -> Result<()> {
                 if quiet && !stream {
                     c.request(&req)
                 } else {
-                    c.request_with_progress(&req, quiet)
+                    c.request_with_progress(&req, quiet, &printed)
                 }
             };
             if check == CheckArg::Skip {
                 let found = ask(LocateCheck::None)?;
                 let found = found.as_array().cloned().unwrap_or_default();
-                if !stream {
-                    for p in &found {
-                        print_path(p.as_str().unwrap_or_default());
+                let shown = printed
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                for p in found.iter().filter_map(Value::as_str) {
+                    if !shown.contains(p) {
+                        print_path(p);
                     }
                 }
                 note(format!(
@@ -685,10 +704,11 @@ fn run(cli: Cli) -> Result<()> {
                 LocateCheck::Exists
             };
             let r: Located = serde_json::from_value(ask(first)?)?;
-            if !stream {
-                for p in &r.paths {
-                    print_path(p);
-                }
+            let shown = printed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for p in r.paths.iter().filter(|p| !shown.contains(*p)) {
+                print_path(p);
             }
             note(format!(
                 "{} in {}: search {}, check on disk {}{}",

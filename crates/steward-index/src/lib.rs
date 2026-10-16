@@ -46,6 +46,9 @@ CREATE TABLE IF NOT EXISTS entries (
 -- was 12 s faster on a 15.7M-entry first scan but peaked 1.1 GB higher,
 -- because building (parent, name) sorts every name in memory.
 CREATE UNIQUE INDEX IF NOT EXISTS entries_parent_name ON entries(parent, name);
+-- Exact-name lookups (locate -x, and locate's first answer): 1 ms instead of
+-- a 0.6 s scan of 14M entries, for +27% file size.
+CREATE INDEX IF NOT EXISTS entries_name ON entries(name);
 -- Content ids are joined to entries through content_entries, which only
 -- holds hashed files; indexing (dev, ino) on every entry cost 13% of the
 -- file and a write per row.
@@ -193,9 +196,6 @@ pub enum ChangeKind {
     Changed,
 }
 
-/// How often a streaming name search hands over what it has found.
-const STREAM_EVERY: std::time::Duration = std::time::Duration::from_millis(100);
-
 /// After this many point lookups a scan loads every hashed inode instead.
 const LINK_LOOKUPS: u32 = 2048;
 
@@ -317,6 +317,18 @@ pub struct NameQuery<'a> {
     pub ignore_case: bool,
     pub kind: Option<KindFilter>,
     pub limit: u32,
+}
+
+impl NameQuery<'_> {
+    /// The mode `Auto` stands for: a glob if the pattern has `*`, `?` or
+    /// `[`, a substring otherwise.
+    pub fn resolved_mode(&self) -> MatchMode {
+        match self.mode {
+            MatchMode::Auto if self.pattern.contains(['*', '?', '[']) => MatchMode::Glob,
+            MatchMode::Auto => MatchMode::Substring,
+            m => m,
+        }
+    }
 }
 
 impl Default for NameQuery<'_> {
@@ -1598,28 +1610,8 @@ impl Index {
         conn: &Connection,
         q: &NameQuery<'_>,
     ) -> Result<Vec<(i64, PathBuf)>> {
-        let mut out = Vec::new();
-        self.find_names_streaming(conn, q, &mut |batch| out.extend(batch))
-            .await?;
-        Ok(out)
-    }
-
-    /// `find_names`, handing matches to `on_batch` as the search finds them:
-    /// the first at once, then every 100 ms or 500 matches. A search reads
-    /// every name, so on a large index the first matches arrive long before
-    /// the last.
-    pub async fn find_names_streaming(
-        &self,
-        conn: &Connection,
-        q: &NameQuery<'_>,
-        on_batch: &mut (dyn FnMut(Vec<(i64, PathBuf)>) + Send),
-    ) -> Result<()> {
         type Keep = Box<dyn Fn(&[u8]) -> bool + Send + Sync>;
-        let mode = match q.mode {
-            MatchMode::Auto if q.pattern.contains(['*', '?', '[']) => MatchMode::Glob,
-            MatchMode::Auto => MatchMode::Substring,
-            m => m,
-        };
+        let mode = q.resolved_mode();
         // Roots are stored by their whole path; locate matches names.
         let kind = " AND parent != 0".to_string()
             + &match q.kind {
@@ -1701,10 +1693,7 @@ impl Index {
         let paths = self.connect()?;
         let mut cache = HashMap::new();
         let mut rows = query(conn, &sql, params).await?;
-        let mut batch = Vec::new();
-        let mut found = 0u32;
-        let mut sent_any = false;
-        let mut last = Instant::now();
+        let mut out = Vec::new();
         while let Some(row) = rows.next().await? {
             if let Some(keep) = &keep
                 && !keep(&blob(&row, 1)?)
@@ -1712,21 +1701,12 @@ impl Index {
                 continue;
             }
             let id = int(&row, 0)?;
-            batch.push((id, self.path_of(&paths, id, &mut cache).await?));
-            found += 1;
-            if !sent_any || batch.len() >= 500 || last.elapsed() >= STREAM_EVERY {
-                on_batch(std::mem::take(&mut batch));
-                sent_any = true;
-                last = Instant::now();
-            }
-            if found >= q.limit {
+            out.push((id, self.path_of(&paths, id, &mut cache).await?));
+            if out.len() >= q.limit as usize {
                 break;
             }
         }
-        if !batch.is_empty() {
-            on_batch(batch);
-        }
-        Ok(())
+        Ok(out)
     }
 
     /// Every entry under `id` (inclusive) with its path.

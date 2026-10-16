@@ -468,23 +468,44 @@ impl TreeView {
         }
         self.message = Some(format!("locating {pattern}…").into());
         let (mode, ignore_case) = (self.locate_mode, self.locate_ignore_case);
+        let (tx, rx) = async_channel::unbounded();
         let task = cx.background_executor().spawn({
             let pattern = pattern.clone();
             async move {
                 // Results are confirmed on disk; folders of gone ones rescanned.
                 fetch(move |c| {
-                    c.locate_checked(
+                    c.locate_streaming(
                         pattern,
                         LOCATE_LIMIT,
                         mode,
                         ignore_case,
                         None,
                         LocateCheck::Rescan,
+                        |exact| {
+                            let _ = tx.send_blocking(exact);
+                        },
                     )
                 })()
             }
         });
         cx.spawn(async move |this, cx| {
+            // Exact name matches arrive first; the full answer replaces them.
+            while let Ok(exact) = rx.recv().await {
+                let pattern = pattern.clone();
+                let _ = this.update(cx, |this, cx| {
+                    this.message = Some(
+                        format!(
+                            "{} exact matches for {pattern}, still searching…",
+                            format::count(exact.len() as u64)
+                        )
+                        .into(),
+                    );
+                    this.hits = exact;
+                    this.hit_selected = 0;
+                    this.mode = Mode::Locate;
+                    cx.notify();
+                });
+            }
             let result = task.await;
             let _ = this.update(cx, |this, cx| {
                 match result {
@@ -508,8 +529,11 @@ impl TreeView {
                             ));
                         }
                         this.note(note);
+                        let chosen = this.hits.get(this.hit_selected).cloned();
+                        this.hit_selected = chosen
+                            .and_then(|c| hits.iter().position(|h| *h == c))
+                            .unwrap_or(0);
                         this.hits = hits;
-                        this.hit_selected = 0;
                         this.mode = Mode::Locate;
                     }
                     Err(e) => this.warn(e),

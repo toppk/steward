@@ -126,10 +126,13 @@ path as its raw bytes (so its output can be fed back to `stat`, `xargs -d
     | `warn` | check, leave gone results out and say how many |
     | `skip` | trust the index; fastest |
 
-    On a terminal, matches print as the search finds them, so the first ones
-    appear at once; when stdout is a pipe or file (or with `--sort`) they
-    are printed sorted by their bytes, as `LC_ALL=C sort` would, once the
-    search is done. The paths alone go to stdout. Rescans are reported on stderr as they happen,
+    Names that match the pattern exactly print first, at once (an index finds
+    them in about a millisecond); the other matches follow when the whole
+    index has been searched, which takes a second or two on a large one. Each
+    group is sorted by its bytes, as `LC_ALL=C sort` would; `--sort` prints
+    one sorted list instead. So when you know the whole name, typing it gives
+    the answer straight away. The paths alone go to stdout. Rescans are
+    reported on stderr as they happen,
     including any wait for a scan already running (such as a root's daily
     full rescan), so a slow answer says why:
 

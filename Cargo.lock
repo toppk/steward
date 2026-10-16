@@ -7034,6 +7034,7 @@ name = "steward-ui"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-channel",
  "chrono",
  "gpui-kit",
  "gpui-omarchy",

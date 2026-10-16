@@ -795,34 +795,34 @@ impl Engine {
         };
         let present =
             |p: &Path| Meta::lstat(p).is_ok_and(|m| q.kind.is_none_or(|k| kind_matches(k, m.kind)));
-        // Streaming: matches go out as the search finds them (checked first
-        // if asked), and the full sorted answer follows.
-        let streaming = stream && progress.is_some();
-        let mut sent: HashSet<PathBuf> = HashSet::new();
+        // Streaming: exact names, found through their index in about a
+        // millisecond, go out first; the full sorted answer follows.
         let t = std::time::Instant::now();
-        let mut hits = if streaming {
-            let mut all = Vec::new();
-            let mut on_batch = |batch: Vec<(i64, PathBuf)>| {
-                let mut fresh = Vec::new();
-                for (_, p) in batch {
-                    if check == LocateCheck::None || present(&p) {
-                        fresh.push(wire::path(&p));
-                        sent.insert(p.clone());
-                    }
-                    all.push(p);
-                }
-                if !fresh.is_empty() {
-                    report("results", String::new(), json!({ "paths": fresh }));
-                }
+        if stream && progress.is_some() && q.resolved_mode() == steward_index::MatchMode::Substring
+        {
+            let exact = steward_index::NameQuery {
+                mode: steward_index::MatchMode::Exact,
+                ignore_case: false,
+                ..q.clone()
             };
-            self.index
-                .find_names_streaming(conn, q, &mut on_batch)
-                .await?;
-            all.sort_by(|a, b| a.as_os_str().as_bytes().cmp(b.as_os_str().as_bytes()));
-            all
-        } else {
-            find().await?
-        };
+            let mut first: Vec<PathBuf> = self
+                .index
+                .find_names(conn, &exact)
+                .await?
+                .into_iter()
+                .map(|(_, p)| p)
+                .filter(|p| check == LocateCheck::None || present(p))
+                .collect();
+            first.sort_by(|a, b| a.as_os_str().as_bytes().cmp(b.as_os_str().as_bytes()));
+            if !first.is_empty() {
+                report(
+                    "exact",
+                    String::new(),
+                    json!({ "paths": first.iter().map(|p| wire::path(p)).collect::<Vec<_>>() }),
+                );
+            }
+        }
+        let mut hits = find().await?;
         let mut search_ms = ms(t);
         let limited = hits.len() >= q.limit as usize;
         if check == LocateCheck::None {
@@ -911,16 +911,6 @@ impl Engine {
             let t = std::time::Instant::now();
             (paths, stale) = gone(&hits);
             check_ms += ms(t);
-            if streaming {
-                let fresh: Vec<String> = paths
-                    .iter()
-                    .filter(|p| !sent.contains(*p))
-                    .map(|p| wire::path(p))
-                    .collect();
-                if !fresh.is_empty() {
-                    report("results", String::new(), json!({ "paths": fresh }));
-                }
-            }
         }
         let show = |v: Vec<PathBuf>| -> Vec<String> { v.iter().map(|p| wire::path(p)).collect() };
         Ok(serde_json::to_value(steward_proto::Located {
