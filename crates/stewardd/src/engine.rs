@@ -820,6 +820,8 @@ impl Engine {
                     String::new(),
                     json!({ "paths": first.iter().map(|p| wire::path(p)).collect::<Vec<_>>() }),
                 );
+                // The search below doesn't yield; let the connection's writer send this first.
+                tokio::task::yield_now().await;
             }
         }
         let mut hits = find().await?;
