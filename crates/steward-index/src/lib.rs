@@ -87,6 +87,12 @@ CREATE TABLE IF NOT EXISTS content_entries (
 CREATE INDEX IF NOT EXISTS content_entries_inode ON content_entries(dev, ino);
 CREATE TABLE IF NOT EXISTS dirty (id INTEGER PRIMARY KEY);
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value INTEGER NOT NULL);
+-- When each scanned folder's last scan started; a scan drops the rows below it.
+CREATE TABLE IF NOT EXISTS scans (
+    path BLOB PRIMARY KEY,
+    started INTEGER NOT NULL,
+    kind TEXT NOT NULL
+);
 ";
 
 /// Bumped whenever the meaning of the `t_*` columns changes; an index built
@@ -725,6 +731,58 @@ impl Index {
         let mut rows = query(&conn, "PRAGMA wal_checkpoint(TRUNCATE)", ()).await?;
         while rows.next().await?.is_some() {}
         Ok(Some((before, size(&self.wal))))
+    }
+
+    /// Note that a `kind` scan of `path` started at `started` (Unix seconds).
+    pub async fn mark_scanned(
+        &self,
+        conn: &Connection,
+        path: &Path,
+        started: i64,
+        kind: &str,
+    ) -> Result<()> {
+        let p = path.as_os_str().as_bytes().to_vec();
+        let mut lo = p.clone();
+        if !lo.ends_with(b"/") {
+            lo.push(b'/');
+        }
+        let mut hi = lo.clone();
+        // '0' follows '/': [lo, hi) is everything below `path`.
+        *hi.last_mut().unwrap_or(&mut 0) = b'0';
+        exec(
+            conn,
+            "DELETE FROM scans WHERE path >= ?1 AND path < ?2",
+            (lo, hi),
+        )
+        .await?;
+        exec(
+            conn,
+            "INSERT OR REPLACE INTO scans (path, started, kind) VALUES (?1, ?2, ?3)",
+            (p, started, kind.to_string()),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// The latest scan that covered `path`: the deepest marked at or above it.
+    pub async fn last_scan(
+        &self,
+        conn: &Connection,
+        path: &Path,
+    ) -> Result<Option<(PathBuf, i64, String)>> {
+        for dir in path.ancestors() {
+            let mut rows = query(
+                conn,
+                "SELECT started, kind FROM scans WHERE path = ?1",
+                (dir.as_os_str().as_bytes().to_vec(),),
+            )
+            .await?;
+            if let Some(row) = rows.next().await? {
+                let kind = String::from_utf8_lossy(&blob(&row, 1)?).into_owned();
+                return Ok(Some((dir.to_path_buf(), int(&row, 0)?, kind)));
+            }
+        }
+        Ok(None)
     }
 
     pub fn connect(&self) -> Result<Connection> {
@@ -1994,21 +2052,6 @@ impl Index {
         )
         .await?;
         Ok(())
-    }
-
-    /// Content ids stored for more than one inode, with their size.
-    pub async fn shared_content_ids(&self, conn: &Connection) -> Result<Vec<(Vec<u8>, u64)>> {
-        let mut rows = query(
-            conn,
-            "SELECT root, max(size) FROM contentids GROUP BY root HAVING count(*) > 1",
-            (),
-        )
-        .await?;
-        let mut out = Vec::new();
-        while let Some(row) = rows.next().await? {
-            out.push((blob(&row, 0)?, int(&row, 1)? as u64));
-        }
-        Ok(out)
     }
 
     /// Keep the 1 MiB verification layer of content `root`.

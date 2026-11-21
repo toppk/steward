@@ -64,6 +64,7 @@ __all__ = [
     "Located",
     "Observation",
     "Resolution",
+    "Scanned",
     "StewardError",
     "Verdict",
     "api_socket_path",
@@ -117,6 +118,18 @@ def _from_dict(cls: Any, d: dict, **conv: Callable[[Any], Any]) -> Any:
 
 
 @dataclass(frozen=True)
+class Scanned:
+    """The latest scan that covered a path: the folder it started from,
+    ``full`` or ``trusting``, when it started and when the root's next
+    scheduled scan is due (seconds since the epoch)."""
+
+    path: str
+    kind: str
+    at: int
+    next: int | None = None
+
+
+@dataclass(frozen=True)
 class Entry:
     """One indexed path. ``total_*`` are subtree totals for directories and
     the entry's own figures otherwise; ``alloc`` is bytes on disk."""
@@ -138,10 +151,14 @@ class Entry:
     tags: list[str] = field(default_factory=list)
     category: str | None = None
     content_id: str | None = None
+    # ``stat`` only: the scan this is as of, and the unmounted folder at or
+    # above it, if any.
+    scanned: Scanned | None = None
+    offline: str | None = None
 
     @classmethod
     def from_dict(cls, d: dict) -> Entry:
-        return _from_dict(cls, d)
+        return _from_dict(cls, d, scanned=lambda s: s and _from_dict(Scanned, s))
 
     @property
     def is_dir(self) -> bool:

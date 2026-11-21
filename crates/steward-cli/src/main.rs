@@ -2,7 +2,7 @@ mod service;
 
 use std::path::PathBuf;
 
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use clap::{Parser, Subcommand};
 use serde_json::{Value, json};
 use steward_proto::{Client, Entry, Request};
@@ -96,6 +96,9 @@ enum Cmd {
         /// Rank by space on disk, or by items (entries beneath: roughly inodes).
         #[arg(short, long, value_enum, default_value_t = By::Space)]
         by: By,
+        /// The directory's `stat` with its `children`, as JSON.
+        #[arg(long)]
+        json: bool,
     },
     /// qdirstat-style tree, largest first.
     Tree {
@@ -107,8 +110,13 @@ enum Cmd {
         /// Rank by space on disk, or by items (entries beneath: roughly inodes).
         #[arg(short, long, value_enum, default_value_t = By::Space)]
         by: By,
+        /// The top entry's `stat`, with nested `children` (and `more` for
+        /// the rest of each folder), as JSON.
+        #[arg(long)]
+        json: bool,
     },
-    /// One entry: its stat fields, subtree totals, tags and content id.
+    /// One entry: its stat fields, subtree totals, tags, content id, and
+    /// the scan it is as of.
     Stat { path: PathBuf },
     /// Find entries by name: substring, or glob if it has * ? [.
     Locate {
@@ -164,13 +172,17 @@ enum Cmd {
     },
     /// Where copies of each content id are now, and whether they are reachable.
     Resolve {
+        #[arg(required = true)]
         ids: Vec<String>,
         /// Re-stat each copy before answering.
         #[arg(long)]
         recheck: bool,
     },
     /// Update the index for these paths now and give their content ids.
-    Inspect { paths: Vec<PathBuf> },
+    Inspect {
+        #[arg(required = true)]
+        paths: Vec<PathBuf>,
+    },
     /// Print content and storage events as they happen (one JSON per line).
     Events {
         /// Replay the daemon's backlog after this sequence number first.
@@ -195,6 +207,15 @@ macro_rules! out {
         if writeln!(std::io::stdout(), $($arg)*).is_err() {
             std::process::exit(0);
         }
+    }};
+}
+
+/// `eprintln!` that doesn't panic once stderr's reader has gone
+/// (`steward locate x 2>&1 | head`).
+macro_rules! note {
+    ($($arg:tt)*) => {{
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stderr(), $($arg)*);
     }};
 }
 
@@ -379,7 +400,9 @@ impl Backend {
         let rt = tokio::runtime::Runtime::new()?;
         let mut config = Config::load()?;
         config.db = std::path::absolute(db)?;
-        let engine = rt.block_on(Engine::open(config))?;
+        let engine = rt
+            .block_on(Engine::open(config.clone()))
+            .with_context(|| format!("opening the index {}", config.db.display()))?;
         Ok(Self::Local(rt, Box::new(engine)))
     }
 
@@ -425,7 +448,7 @@ impl Backend {
             if let Some(m) = v["message"].as_str().filter(|m| !m.is_empty())
                 && !quiet
             {
-                eprintln!("steward: {m}");
+                note!("steward: {m}");
             }
         };
         match self {
@@ -477,6 +500,70 @@ fn tree(c: &mut Backend, e: &Entry, depth: u32, top: usize, by: By, indent: usiz
         );
     }
     Ok(())
+}
+
+/// `tree`'s answer as JSON: each folder's top `children`, and `more` for
+/// the rest of it.
+fn tree_json(c: &mut Backend, e: &Entry, depth: u32, top: usize, by: By) -> Result<Value> {
+    let mut v = serde_json::to_value(e)?;
+    if depth == 0 || !matches!(e.kind, steward_proto::Kind::Dir) {
+        return Ok(v);
+    }
+    let mut kids = c.children(steward_proto::wire::to_path(&e.path))?;
+    kids.sort_by_key(|k| std::cmp::Reverse(by.of(k)));
+    let rest = &kids[top.min(kids.len())..];
+    if !rest.is_empty() {
+        v["more"] = json!({
+            "entries": rest.len(),
+            "total_alloc": rest.iter().map(|k| k.total_alloc).sum::<u64>(),
+            "total_items": rest.iter().map(|k| k.total_items).sum::<u64>(),
+        });
+    }
+    let shown = kids
+        .iter()
+        .take(top)
+        .map(|k| tree_json(c, k, depth - 1, top, by))
+        .collect::<Result<Vec<_>>>()?;
+    v["children"] = json!(shown);
+    Ok(v)
+}
+
+/// The column names over `line`'s output.
+fn header(by: By) {
+    let (first, other) = match by {
+        By::Space => ("SPACE", "FILES"),
+        By::Items => ("ITEMS", "SPACE"),
+    };
+    out!("{first:>8} {:>6} {:<10} {other:>8} NAME  TAGS", "%", "");
+}
+
+/// One line on stderr: which scan the answer is as of, and how to update it.
+fn freshness(e: &Entry) {
+    let p = steward_proto::wire::display(&e.path);
+    if let Some(off) = &e.offline {
+        let off = steward_proto::wire::display(off);
+        note!(
+            "steward: {off} is offline (its volume is not mounted); this is what was \
+             indexed before it went"
+        );
+        return;
+    }
+    let now = stewardd::engine::unix_now() as i64;
+    let span = stewardd::engine::span;
+    let Some(s) = &e.scanned else {
+        note!("steward: no scan of {p} recorded yet; `steward scan {p}` updates it now");
+        return;
+    };
+    let from = steward_proto::wire::display(&s.path);
+    let next = s
+        .next
+        .map(|t| format!(", next in {}", span(t - now)))
+        .unwrap_or_default();
+    note!(
+        "steward: as of the {} scan of {from}, {} ago{next}; `steward scan {p}` updates it now",
+        s.kind,
+        span(now - s.at)
+    );
 }
 
 #[derive(Subcommand)]
@@ -602,12 +689,26 @@ fn run(cli: Cli) -> Result<()> {
             read_root: trust,
         })?,
         Cmd::Invalidate { path } => c.request(&Request::Invalidate { path: abs(path)? })?,
-        Cmd::Ls { path, by } => {
+        Cmd::Ls { path, by, json } => {
             let path = abs(path)?;
             let me: Entry =
                 serde_json::from_value(c.request(&Request::Stat { path: path.clone() })?)?;
-            let mut kids = c.children(path)?;
+            let mut kids = if matches!(me.kind, steward_proto::Kind::Dir) {
+                c.children(path)?
+            } else {
+                vec![]
+            };
             kids.sort_by_key(|k| std::cmp::Reverse(by.of(k)));
+            if json {
+                let mut v = serde_json::to_value(&me)?;
+                v["children"] = serde_json::to_value(&kids)?;
+                return print_json(&v);
+            }
+            freshness(&me);
+            header(by);
+            if !matches!(me.kind, steward_proto::Kind::Dir) {
+                line(&me, &me, by, 0);
+            }
             for k in &kids {
                 line(k, &me, by, 0);
             }
@@ -618,9 +719,15 @@ fn run(cli: Cli) -> Result<()> {
             depth,
             top,
             by,
+            json,
         } => {
             let me: Entry =
                 serde_json::from_value(c.request(&Request::Stat { path: abs(path)? })?)?;
+            if json {
+                return print_json(&tree_json(&mut c, &me, depth, top, by)?);
+            }
+            freshness(&me);
+            header(by);
             line(&me, &me, by, 0);
             return tree(&mut c, &me, depth, top, by, 1);
         }
@@ -641,7 +748,7 @@ fn run(cli: Cli) -> Result<()> {
             let started = std::time::Instant::now();
             let note = |line: String| {
                 if !quiet {
-                    eprintln!("steward: {line}");
+                    note!("steward: {line}");
                 }
             };
             let mode = if exact {
@@ -786,7 +893,7 @@ fn run(cli: Cli) -> Result<()> {
             };
             let ids = (!id.is_empty()).then_some(id);
             let mut stream = client.subscribe(since, ids)?;
-            eprintln!("{}", stream.start);
+            note!("{}", stream.start);
             for msg in &mut stream {
                 print_json_line(&msg?);
             }

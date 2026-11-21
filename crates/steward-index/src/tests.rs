@@ -481,3 +481,28 @@ async fn find_names_by_mode_case_and_kind() {
     // Roots are not names.
     assert!(find("root", Substring, false, None).await.is_empty());
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn last_scan_is_the_deepest_mark_and_a_scan_drops_marks_below_it() {
+    let (_tmp, index, root) = fixture().await;
+    let conn = index.connect().unwrap();
+    let ab = root.join("a/b");
+    assert_eq!(index.last_scan(&conn, &ab).await.unwrap(), None);
+    index.mark_scanned(&conn, &root, 100, "full").await.unwrap();
+    index
+        .mark_scanned(&conn, &root.join("ab"), 250, "full")
+        .await
+        .unwrap();
+    index
+        .mark_scanned(&conn, &root.join("a"), 200, "trusting")
+        .await
+        .unwrap();
+    // A sibling whose name only starts the same is not below `root/a`.
+    let got = index.last_scan(&conn, &root.join("ab")).await.unwrap();
+    assert_eq!(got, Some((root.join("ab"), 250, "full".into())));
+    let got = index.last_scan(&conn, &ab.join("two.txt")).await.unwrap();
+    assert_eq!(got, Some((root.join("a"), 200, "trusting".into())));
+    index.mark_scanned(&conn, &root, 300, "full").await.unwrap();
+    let got = index.last_scan(&conn, &ab).await.unwrap();
+    assert_eq!(got, Some((root.clone(), 300, "full".into())));
+}

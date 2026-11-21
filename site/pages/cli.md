@@ -63,16 +63,18 @@ path as its raw bytes (so its output can be fed back to `stat`, `xargs -d
 :   The settings file, each root's policy, its index totals and whether it
     is offline.
 
-`steward ls PATH [--by space|items]`
+`steward ls PATH [--by space|items] [--json]`
 :   The children of a directory, largest on disk first, with size, share,
-    file count and tags.
+    file count and tags. For a file, its own line.
 
-`steward tree PATH [-d DEPTH] [-t TOP] [--by space|items]`
+`steward tree PATH [-d DEPTH] [-t TOP] [--by space|items] [--json]`
 :   A qdirstat-style tree, largest first: `DEPTH` levels (default 2),
     the `TOP` largest children at each level (default 10).
 
     ```
     $ steward tree /usr/share -d 1 -t 4
+    steward: as of the full scan of /usr, 14 h ago, next in 10 h; `steward scan /usr/share` updates it now
+       SPACE      %               FILES NAME  TAGS
        13.6G 100.0% ##########   318801 share/
         3.9G  28.6% ###           23851   kicad/
         1.4G   9.9% #              2779   virtio-win/
@@ -81,8 +83,10 @@ path as its raw bytes (so its output can be fed back to `stat`, `xargs -d
         6.5G                      ... 469 more
     ```
 
-    The columns are space on disk, share of the parent, a bar, and the
-    number of files beneath.
+    The first line, on stderr, says which scan the answer is as of and how
+    to bring it up to date; for a folder on an unmounted volume it says that
+    instead. The columns are space on disk, share of the parent, a bar, the
+    number of files beneath, and tags.
 
     `--by items` ranks by **items** instead: every entry beneath (files,
     directories, symlinks and the rest), which is what uses up inodes (or
@@ -91,6 +95,7 @@ path as its raw bytes (so its output can be fed back to `stat`, `xargs -d
 
     ```
     $ steward tree /usr/share -d 1 -t 3 --by items
+       ITEMS      %               SPACE NAME  TAGS
       390.3k 100.0% ##########    13.6G share/
        58.4k  15.0% #            172.9M   icons/
        43.3k  11.1% #            655.4M   doc/
@@ -98,10 +103,15 @@ path as its raw bytes (so its output can be fed back to `stat`, `xargs -d
       250.7k                      ... 470 more
     ```
 
+    `--json` prints the same answer as JSON instead: the top entry's
+    `stat`, with `children` (for `tree`, nested, and `more` counting the
+    rest of each folder).
+
 `steward stat PATH`
 :   One entry as JSON: type, mode, owner, size, space on disk, modification
-    time, subtree totals, tags (including inherited ones), file category and
-    current content id.
+    time, subtree totals, tags (including inherited ones), file category,
+    current content id, the scan it is as of (`scanned`), and `offline` when
+    its volume is not mounted.
 
 `steward locate PATTERN [-x | -g | -r] [-i] [-t f|d|l|o] [--check MODE] [-l LIMIT] [-q] [--sort]`
 :   Paths whose final name component matches. By default, like classic
@@ -177,7 +187,8 @@ path as its raw bytes (so its output can be fed back to `stat`, `xargs -d
 
 `steward dups PATH [-l LIMIT]`
 :   Groups of identical files under `PATH` (among hashed files), most wasted
-    space first. Default limit 50.
+    space first. Default limit 50. Hard links to one file share its space,
+    so they are listed but not counted as wasted.
 
 `steward content-summary PATH`
 :   How many files and bytes under `PATH` have content ids, distinct ids,
@@ -196,8 +207,9 @@ path as its raw bytes (so its output can be fed back to `stat`, `xargs -d
 `steward scan PATH [--trust]`
 :   Rescan `PATH` now and wait for it. `--trust` reads `PATH`'s own listing
     but skips the directories below it whose times show nothing changed: the
-    quick way to catch up a folder you just cleaned up. The path must be
-    under a configured root.
+    quick way to catch up a folder you just cleaned up. For a file, its
+    folder's listing is read again. The path must be under a configured
+    root.
 
 `steward invalidate PATH`
 :   Tell the daemon something under `PATH` changed. It rescans a couple of

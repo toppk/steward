@@ -166,7 +166,10 @@ class ClientTest(unittest.TestCase):
             self.assertEqual(os.fsencode(i.path), raw)
             [hit] = c.locate("caf", mode="substring")
             self.assertEqual(os.fsencode(hit), raw)
-            self.assertEqual(c.stat(hit).size, 5000)
+            st = c.stat(hit)
+            self.assertEqual(st.size, 5000)
+            self.assertIn(st.scanned.kind, ("full", "trusting"))
+            self.assertIsNone(st.offline)
             [r] = c.resolve([i.id])
             self.assertEqual(os.fsencode(r.observations[0].path), raw)
 

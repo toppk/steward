@@ -10,7 +10,9 @@ use steward_contentid::ContentId;
 use steward_index::{
     ChangeKind, Index, Kind, KindFilter, MatchMode, Meta, Record, ScanOptions, ScanStats,
 };
-use steward_proto::{ContentRef, Entry, LocateCheck, LocateMode, Request, ScanReport, wire};
+use steward_proto::{
+    ContentRef, Entry, LocateCheck, LocateMode, Request, ScanReport, Scanned, wire,
+};
 use tokio::sync::{Mutex, mpsc};
 use tracing::Instrument;
 
@@ -124,7 +126,17 @@ pub struct HashProgress {
     pub started: f64,
 }
 
-fn unix_now() -> f64 {
+/// A span of time for people: `40 s`, `25 min`, `14 h`, `3 days`.
+pub fn span(secs: i64) -> String {
+    match secs.max(0) {
+        s @ 0..120 => format!("{s} s"),
+        s @ 120..7200 => format!("{} min", s / 60),
+        s @ 7200..172_800 => format!("{} h", s / 3600),
+        s => format!("{} days", s / 86_400),
+    }
+}
+
+pub fn unix_now() -> f64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0.0, |d| d.as_secs_f64())
@@ -400,6 +412,8 @@ pub fn entry(r: &Record, path: &Path, tags: Vec<String>) -> Entry {
             .flatten()
             .map(Into::into),
         content_id: None,
+        scanned: None,
+        offline: None,
     }
 }
 
@@ -563,7 +577,16 @@ impl Engine {
                 read_root,
             } => {
                 self.require_root(&path)?;
-                serde_json::to_value(self.refresh_with(&path, trust_dir_mtime, read_root).await?)?
+                // A file is rescanned by rereading its folder's listing.
+                let file_dir = Meta::lstat(&path)
+                    .ok()
+                    .filter(|m| m.kind != Kind::Dir)
+                    .and(path.parent());
+                let r = match file_dir {
+                    Some(dir) => self.refresh_with(dir, true, true).await?,
+                    None => self.refresh_with(&path, trust_dir_mtime, read_root).await?,
+                };
+                serde_json::to_value(r)?
             }
             Request::Invalidate { path } => match &self.invalidate {
                 Some(tx) => {
@@ -583,6 +606,10 @@ impl Engine {
                 let tags = idx.effective_tags(&conn, id).await?;
                 let mut e = entry(&r, &path, tags);
                 e.content_id = self.stored_id(&conn, &r).await?;
+                e.scanned = self.scanned(&conn, &path).await?;
+                // The ancestors of a child of `path` include `path` itself.
+                let offline = self.offline_ancestor(&conn, &path.join("x")).await?;
+                e.offline = offline.map(|p| wire::path(&p));
                 serde_json::to_value(e)?
             }
             Request::Children { path } => {
@@ -932,10 +959,8 @@ impl Engine {
             return Err(fail(
                 "not_under_root",
                 format!(
-                    "{} is not under a configured root; add a [[root]] to {} and run \
-                     `steward reload`",
-                    path.display(),
-                    Config::path().display()
+                    "{} is not under a configured root; `steward put-root DIR` adds one",
+                    path.display()
                 ),
             ));
         }
@@ -1058,6 +1083,31 @@ impl Engine {
             }
         }
         Ok(json!(out))
+    }
+
+    async fn mark_scanned(&self, path: &Path, started: i64, kind: &str) -> Result<()> {
+        let conn = self.index.connect()?;
+        self.index.mark_scanned(&conn, path, started, kind).await
+    }
+
+    /// The latest scan covering `path`, and its root's next scheduled one.
+    async fn scanned(&self, conn: &turso::Connection, path: &Path) -> Result<Option<Scanned>> {
+        let Some((from, at, kind)) = self.index.last_scan(conn, path).await? else {
+            return Ok(None);
+        };
+        let next = self.config().root_for(path).and_then(|r| {
+            let next = self
+                .next_scans
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            next.get(&r.path).map(|t| *t as i64)
+        });
+        Ok(Some(Scanned {
+            path: wire::path(&from),
+            kind,
+            at,
+            next,
+        }))
     }
 
     /// The indexed directory above `path` whose volume is not mounted now:
@@ -1551,13 +1601,36 @@ impl Engine {
         let config = self.config();
         let p = path.display();
         match config.root_for(path) {
-            Some(r) if self.index.resolve(conn, &r.path).await?.is_some() => Err(fail(
-                "not_indexed",
-                format!(
-                    "{p} is not in the index: nothing by that name under root {}",
-                    r.path.display()
-                ),
-            )),
+            Some(r) if self.index.resolve(conn, &r.path).await?.is_some() => {
+                if Meta::lstat(path).is_err() {
+                    return Err(fail(
+                        "not_indexed",
+                        format!("{p} does not exist, on disk or in the index"),
+                    ));
+                }
+                let mut known = path;
+                while let Some(up) = known.parent() {
+                    known = up;
+                    if self.index.resolve(conn, known).await?.is_some() {
+                        break;
+                    }
+                }
+                let when = match self.index.last_scan(conn, known).await? {
+                    Some((_, at, _)) => {
+                        format!("last scanned {} ago", span(unix_now() as i64 - at))
+                    }
+                    None => "never scanned on record".into(),
+                };
+                Err(fail(
+                    "not_indexed",
+                    format!(
+                        "{p} exists but is not in the index yet ({} was {when}); \
+                         `steward scan {}` adds it",
+                        known.display(),
+                        known.display()
+                    ),
+                ))
+            }
             Some(r) => Err(fail(
                 "not_indexed",
                 format!(
@@ -1567,7 +1640,10 @@ impl Engine {
             )),
             None => Err(fail(
                 "not_indexed",
-                format!("{p} is not indexed: no configured root covers it"),
+                format!(
+                    "{p} is not indexed: no configured root covers it; \
+                     `steward put-root DIR` adds one"
+                ),
             )),
         }
     }
@@ -1629,7 +1705,11 @@ impl Engine {
     ) -> Result<ScanStats> {
         let _scanning = self.activity.scanning(path, kind);
         tracing::debug!("started (excludes: {:?})", opts.exclude);
+        let started = unix_now() as i64;
         let stats = self.index.scan(path, opts).await?;
+        if let Err(e) = self.mark_scanned(path, started, kind).await {
+            tracing::warn!("recording the scan of {}: {e:#}", path.display());
+        }
         for p in &stats.offline {
             tracing::warn!(
                 "{} is offline (its volume is not mounted); left as indexed",
@@ -2137,28 +2217,42 @@ impl Engine {
         Some(p)
     }
 
-    /// Content stored at more than one path, as far as those paths lie under
-    /// `path`. Groups come from the content-id table, not a tree walk, so
-    /// this stays cheap on any root and finds copies across folders.
+    /// Content held by more than one inode under `path`, from a walk of that
+    /// subtree: its cost follows the subtree, not the whole content table.
     pub async fn duplicates(&self, path: &Path, limit: u32) -> Result<Value> {
         let conn = self.index.connect()?;
-        self.resolve(&conn, path).await?;
-        let mut dups = Vec::new();
-        let mut cache = HashMap::new();
-        for (root, size) in self.index.shared_content_ids(&conn).await? {
-            let mut paths = Vec::new();
-            for id in self.index.find_content(&conn, &root).await? {
-                let p = self.index.path_of(&conn, id, &mut cache).await?;
-                if p.starts_with(path) {
-                    paths.push(wire::path(&p));
+        let top = self.resolve(&conn, path).await?;
+        type Group = (u64, HashSet<(u64, u64)>, Vec<String>);
+        let mut ids: HashMap<Vec<u8>, Group> = HashMap::new();
+        let mut stack = vec![(top, path.to_path_buf())];
+        while let Some((dir, at)) = stack.pop() {
+            for r in self.index.children_of(&conn, dir).await? {
+                let p = at.join(&r.name);
+                match r.meta.kind {
+                    Kind::Dir => stack.push((r.id, p)),
+                    Kind::File => {
+                        if let Some(root) = self.index.fresh_content_id(&conn, &r.meta).await? {
+                            let g = ids
+                                .entry(root)
+                                .or_insert_with(|| (r.meta.size, HashSet::new(), Vec::new()));
+                            g.1.insert((r.meta.dev, r.meta.ino));
+                            g.2.push(wire::path(&p));
+                        }
+                    }
+                    _ => {}
                 }
             }
-            if paths.len() > 1 {
-                paths.sort();
-                let wasted = size * (paths.len() as u64 - 1);
-                dups.push((wasted, steward_contentid::hex(&root), size, paths));
-            }
         }
+        // Hard links to one inode share their bytes: only extra inodes waste space.
+        let mut dups: Vec<_> = ids
+            .into_iter()
+            .filter(|(_, (_, inodes, _))| inodes.len() > 1)
+            .map(|(root, (size, inodes, mut paths))| {
+                paths.sort();
+                let wasted = size * (inodes.len() as u64 - 1);
+                (wasted, steward_contentid::hex(&root), size, paths)
+            })
+            .collect();
         dups.sort_by_key(|d| std::cmp::Reverse(d.0));
         dups.truncate(limit as usize);
         Ok(json!(

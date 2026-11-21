@@ -194,7 +194,16 @@ The daemon's state. No parameters.
 
 ### stat
 
-`{path}` → Entry, with tags inherited from its ancestors.
+`{path}` → Entry, with tags inherited from its ancestors, and two fields
+only `stat` fills in:
+
+| field | |
+|---|---|
+| `scanned` | the latest scan that covered `path`: `path` (the folder it started from), `kind` (`full` or `trusting`), `at` (when it started, seconds since epoch), `next` (the root's next scheduled scan); absent if none is recorded yet |
+| `offline` | the folder at or above `path` whose volume is not mounted, if any: the entry is as last indexed |
+
+A path under a root that isn't in the index is `not_indexed`; the message
+says whether it exists on disk and names the folder to scan.
 
 ### children
 
@@ -248,8 +257,9 @@ every name, which takes a few seconds on a very large index.
 
 ### duplicates
 
-`{path, limit = 1000}` → groups of identical hashed files with at least two
-paths under `path`, most wasted space first:
+`{path, limit = 1000}` → groups of identical hashed files under `path` held
+by at least two inodes, most wasted space first. Hard links share one
+inode's space: they are listed in `paths` but not counted in `wasted`.
 
 ```json
 [{"id":"btv2:…","size":1048576000,"wasted":2097152000,"paths":["/a/x.mkv","/b/x.mkv","/c/x (1).mkv"]}]
@@ -390,7 +400,8 @@ epoch, re-resolve whatever you track.
 `{path, trust_dir_mtime = false, read_root = false}` → ScanReport. Rescan
 `path` (a root or anything under one) now and wait. `trust_dir_mtime` skips
 directories whose times show nothing changed; `read_root` still reads
-`path`'s own listing. Error: `not_under_root`.
+`path`'s own listing. For a file, its folder's listing is read again (the
+folders below trusted). Error: `not_under_root`.
 
 ### classify
 

@@ -383,6 +383,27 @@ pub struct Entry {
     /// `btv2:<hex>` when a current content id is stored for this file.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content_id: Option<String>,
+    /// `stat` only: the scan this entry is as of.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scanned: Option<Scanned>,
+    /// `stat` only: the folder at or above this path whose volume is not
+    /// mounted now; what is shown is as last indexed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offline: Option<String>,
+}
+
+/// The most recent scan that covered a path.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Scanned {
+    /// The folder that scan started from: the path or one above it.
+    pub path: String,
+    /// `full` (every file statted) or `trusting` (unchanged folders not reread).
+    pub kind: String,
+    /// When it started, in Unix seconds; changes after this may be missing.
+    pub at: i64,
+    /// When the root's next scheduled scan is due, in Unix seconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next: Option<i64>,
 }
 
 /// One indexed subtree of `/` and the policy for it. All roots share one

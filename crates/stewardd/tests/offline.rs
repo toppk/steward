@@ -59,6 +59,10 @@ async fn unmounted_volume_is_offline_then_online() {
     let obs = &r[0]["observations"][0];
     assert_eq!(obs["online"], false);
     assert_eq!(obs["offline_at"], json!(vol));
+    let stat = |path| engine.handle(Request::Stat { path });
+    assert_eq!(stat(vol.clone()).await.unwrap()["offline"], json!(vol));
+    assert_eq!(stat(film.clone()).await.unwrap()["offline"], json!(vol));
+    assert!(stat(data.clone()).await.unwrap().get("offline").is_none());
 
     let mut events = engine.events.subscribe(None).live;
     engine.refresh(&data, false).await.unwrap();
