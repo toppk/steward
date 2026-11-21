@@ -50,7 +50,10 @@ jobs:
             libxkbcommon-dev libxkbcommon-x11-dev libxcb1-dev libwayland-dev \
             libfontconfig-dev libfreetype-dev libvulkan-dev
 
-      - uses: dtolnay/rust-toolchain@stable
+      # 1.100 fails to compile turso_core 0.8.1.
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.99.1
 
       - uses: Swatinem/rust-cache@v2
         with:
