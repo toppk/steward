@@ -44,6 +44,7 @@ pub async fn run() -> Result<()> {
     engine.managed = true;
     let engine = Arc::new(engine);
     engine.prune().await?;
+    engine.shrink_wal().await;
 
     let socket = steward_proto::socket_path();
     let listener = bind(&socket)?;

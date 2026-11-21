@@ -1612,6 +1612,7 @@ impl Engine {
         if config.root_for(&stats.root).is_none_or(|r| r.classify) {
             self.classify_logged(&stats.root).await;
         }
+        self.shrink_wal().await;
         drop(guard);
         self.queue_hashing(config.content_id_targets(&stats.root))
             .await;
@@ -1661,6 +1662,19 @@ impl Engine {
             steward_index::rss()
         );
         Ok(stats)
+    }
+
+    /// Keep the write-ahead log from holding on to a scan's worth of disk.
+    pub async fn shrink_wal(&self) {
+        match self.index.shrink_wal().await {
+            Ok(Some((before, after))) => tracing::info!(
+                "write-ahead log checkpointed: {} MB -> {} MB",
+                before >> 20,
+                after >> 20
+            ),
+            Ok(None) => {}
+            Err(e) => tracing::warn!("checkpointing the write-ahead log: {e:#}"),
+        }
     }
 
     async fn classify_logged(&self, path: &Path) {

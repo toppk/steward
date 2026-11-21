@@ -199,6 +199,9 @@ pub enum ChangeKind {
 /// After this many point lookups a scan loads every hashed inode instead.
 const LINK_LOOKUPS: u32 = 2048;
 
+/// The write-ahead log size `shrink_wal` truncates beyond.
+const WAL_LIMIT: u64 = 64 << 20;
+
 /// A hashed inode's (size, mtime, root) by its (dev, ino).
 type HashedInodes = HashMap<(i64, i64), (i64, i64, Vec<u8>)>;
 
@@ -394,6 +397,7 @@ pub struct StoredContentId {
 #[derive(Debug)]
 pub struct Index {
     db: Database,
+    wal: PathBuf,
 }
 
 fn int(row: &Row, i: usize) -> Result<i64> {
@@ -702,7 +706,25 @@ impl Index {
             .await?;
             exec(&conn, "COMMIT", ()).await?;
         }
-        Ok(Self { db })
+        Ok(Self {
+            db,
+            wal: PathBuf::from(format!("{path}-wal")),
+        })
+    }
+
+    /// Checkpoint and truncate the write-ahead log once it passes `WAL_LIMIT`:
+    /// it otherwise keeps the size of its largest burst (a first scan's
+    /// gigabytes) for good. Returns its size before and after, if it acted.
+    pub async fn shrink_wal(&self) -> Result<Option<(u64, u64)>> {
+        let size = |p: &Path| std::fs::metadata(p).map_or(0, |m| m.len());
+        let before = size(&self.wal);
+        if before <= WAL_LIMIT {
+            return Ok(None);
+        }
+        let conn = self.connect()?;
+        let mut rows = query(&conn, "PRAGMA wal_checkpoint(TRUNCATE)", ()).await?;
+        while rows.next().await?.is_some() {}
+        Ok(Some((before, size(&self.wal))))
     }
 
     pub fn connect(&self) -> Result<Connection> {
