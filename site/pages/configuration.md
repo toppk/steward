@@ -47,7 +47,7 @@ once.
 | `path` | *required* | The directory to index: absolute, or starting with `~`. |
 | `interval_minutes` | `1440` (a day) | Time between scheduled rescans. At least 1. |
 | `full_every` | `1` | Every Nth scheduled rescan is full; the rest are trusting. `0` and `1` both mean always full. See [Staying current](concepts.html#staying-current-without-inotify). |
-| `one_filesystem` | `true` | Don't descend into other filesystems mounted below `path`. |
+| `one_filesystem` | `true` | Don't descend into other filesystems mounted below `path`. Btrfs subvolumes in the same mount are descended into. |
 | `exclude` | `[]` | Paths not to index at all, as gitignore patterns relative to `path`. |
 | `classify` | `true` | Tag repositories, ignored files, build output, caches and the like. |
 | `contentid` | `[]` | Folders whose files get content ids automatically, relative to `path` or absolute (inside the root). |

@@ -90,7 +90,9 @@ Offline status shows up in `settings`, in `resolve` results, in
 
 By default (`one_filesystem = true`) a root does not descend into other
 filesystems mounted beneath it. Make another root for each one you want
-indexed.
+indexed. Btrfs subvolumes (and so snapshots) inside the same mount are
+part of it and are indexed; to leave out a snapshot folder such as
+`.snapshots`, add it to `exclude`.
 
 ## Classification
 

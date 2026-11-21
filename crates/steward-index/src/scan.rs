@@ -84,6 +84,21 @@ fn fs_id(st_dev: u64, path: &Path, is_dir: bool) -> u64 {
     id
 }
 
+/// The mount `path` is on (`statx` `STATX_MNT_ID`, Linux 5.8+).
+fn mount_id(path: &Path) -> Option<u64> {
+    use rustix::fs::{AtFlags, CWD, StatxFlags, statx};
+    let s = statx(CWD, path, AtFlags::SYMLINK_NOFOLLOW, StatxFlags::MNT_ID).ok()?;
+    StatxFlags::from_bits_retain(s.stx_mask)
+        .contains(StatxFlags::MNT_ID)
+        .then_some(s.stx_mnt_id)
+}
+
+/// Whether `child`, whose filesystem id differs from `dir`'s, is still on
+/// the same mount: a btrfs subvolume is, another filesystem mounted there isn't.
+fn same_mount(dir: &Path, child: &Path) -> bool {
+    matches!((mount_id(dir), mount_id(child)), (Some(a), Some(b)) if a == b)
+}
+
 /// Mount topology can change between scans (a volume unmounted, another
 /// mounted with a reused `st_dev`); each scan starts with a fresh map.
 pub fn forget_filesystems() {
@@ -219,16 +234,29 @@ impl Walker {
                 return;
             }
         };
-        rayon::scope(|s| self.visit(s, root.to_path_buf(), id, parent, meta));
+        rayon::scope(|s| self.visit(s, root.to_path_buf(), id, parent, meta, None));
     }
 
-    fn visit<'s>(&'s self, s: &rayon::Scope<'s>, path: PathBuf, id: i64, parent: i64, meta: Meta) {
+    /// `parent_dev`: the filesystem of the directory holding `path`, when
+    /// this scan has it.
+    fn visit<'s>(
+        &'s self,
+        s: &rayon::Scope<'s>,
+        path: PathBuf,
+        id: i64,
+        parent: i64,
+        meta: Meta,
+        parent_dev: Option<u64>,
+    ) {
         if self.counters.cancelled.load(Ordering::Relaxed) {
             return;
         }
         let known = self.snapshot.get(&id);
+        // An unmounted volume leaves its mount point on the parent's
+        // filesystem; a folder that became a btrfs subvolume isn't offline.
         if let Some(k) = known
             && k.dev != meta.dev
+            && parent_dev.is_none_or(|d| d == meta.dev)
         {
             self.counters
                 .offline
@@ -261,7 +289,7 @@ impl Walker {
                 if let Ok(m) = Meta::lstat(&child)
                     && m.kind == Kind::Dir
                     && !self.excluded(&child, true)
-                    && (!self.one_filesystem || m.dev == meta.dev)
+                    && (!self.one_filesystem || m.dev == meta.dev || same_mount(&path, &child))
                 {
                     subdirs.push((child, *cid, m));
                 }
@@ -284,8 +312,9 @@ impl Walker {
             self.counters.cancelled.store(true, Ordering::Relaxed);
             return;
         }
+        let dev = meta.dev;
         for (child, cid, m) in subdirs {
-            s.spawn(move |s| self.visit(s, child, cid, id, m));
+            s.spawn(move |s| self.visit(s, child, cid, id, m, Some(dev)));
         }
     }
 
@@ -334,7 +363,7 @@ impl Walker {
                     .unwrap_or_else(|| self.next_id.fetch_add(1, Ordering::Relaxed))
             });
             if let Some(cid) = dir_id
-                && (!self.one_filesystem || m.dev == dev)
+                && (!self.one_filesystem || m.dev == dev || same_mount(path, &child))
             {
                 subdirs.push((child, cid, m));
             }
