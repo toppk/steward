@@ -62,10 +62,18 @@ exclude = [
   "*.iso",                   # any file or directory with this name, anywhere
   "node_modules/",           # trailing slash: directories only
   "!/keep/node_modules/",    # negation re-includes
+  "~/scratch/",              # a full path inside the root works too: here "/scratch/"
 ]
 ```
 
+A pattern that is a full path inside the root (absolute, or starting with
+`~`) is read as that path: `/home/me/.snapshot` under the root `/home/me`
+means `/.snapshot`. `steward settings` shows each pattern as steward reads it.
+
 Excluded paths are not scanned, not counted in totals and never hashed.
+Changing `exclude` and running `steward reload` rescans the root, which
+drops what the new patterns match from the index (the files themselves are
+untouched) and brings back what they no longer match.
 
 ### Content id folders
 

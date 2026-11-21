@@ -42,6 +42,23 @@ pub fn expand(p: &Path) -> PathBuf {
     }
 }
 
+/// An exclude naming a path inside `root` absolutely (or as `~/…`), as the
+/// root-relative pattern that matches it: `/home/me/.snapshot` -> `/.snapshot`.
+fn anchor(root: &Path, pattern: &str) -> String {
+    let (not, body) = match pattern.strip_prefix('!') {
+        Some(b) => ("!", b),
+        None => ("", pattern),
+    };
+    let full = expand(Path::new(body));
+    match full.strip_prefix(root) {
+        Ok(rel) if full.is_absolute() && !rel.as_os_str().is_empty() => {
+            let slash = if body.ends_with('/') { "/" } else { "" };
+            format!("{not}/{}{slash}", rel.to_string_lossy())
+        }
+        _ => pattern.to_string(),
+    }
+}
+
 fn default_db() -> PathBuf {
     xdg("XDG_STATE_HOME", ".local/state").join("steward/index.db")
 }
@@ -76,6 +93,9 @@ impl Config {
             let base = r.path.clone();
             for c in &mut r.contentid {
                 *c = base.join(expand(c));
+            }
+            for e in &mut r.exclude {
+                *e = anchor(&base, e);
             }
         }
         Ok(config)
@@ -148,5 +168,21 @@ mod tests {
         assert_eq!(c.hash_threads(), default_hash_threads());
         assert_eq!(Config::parse("hash_threads = 8").unwrap().hash_threads(), 8);
         assert_eq!(Config::parse("hash_threads = 0").unwrap().hash_threads(), 1);
+    }
+
+    #[test]
+    fn absolute_excludes_inside_the_root_become_anchored() {
+        let c = Config::parse(
+            r#"
+            [[root]]
+            path = "/home/me"
+            exclude = ["/home/me/.snapshot/", "!/home/me/keep", "/down/big", "/home/other", "*.iso"]
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            c.roots[0].exclude,
+            ["/.snapshot/", "!/keep", "/down/big", "/home/other", "*.iso"]
+        );
     }
 }
